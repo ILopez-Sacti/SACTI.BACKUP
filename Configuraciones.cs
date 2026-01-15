@@ -1,6 +1,6 @@
 ﻿
 using Newtonsoft.Json.Linq;
-using Sacti.FrameworkUI.Librerias;
+
 using SACTIBACKUP.Entidades;
 using SACTIBACKUP.Infrastructure;
 using System.ComponentModel;
@@ -380,11 +380,11 @@ public partial class Configuraciones : Form
         {
             OcultarConectando();
         }
-
-        if(Mensaje.Pregunta("¿Desea realizar respaldo en este momento?"))
-        {
-            RealizarRespaldo = true;
-        }
+        RealizarRespaldo = true;
+        //if (Mensaje.Pregunta("¿Desea realizar respaldo en este momento?"))
+        //{
+            
+        //}
 
 
     }

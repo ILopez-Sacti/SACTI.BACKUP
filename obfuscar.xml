@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<Obfuscator>
+
+  <!-- Rutas -->
+  <Var name="InPath" value="bin\Release\net8.0\publish" />
+  <Var name="OutPath" value="obfuscated" />
+
+  <!-- Opciones globales -->
+  <Var name="HidePrivateApi" value="true" />
+  <Var name="ReuseNames" value="false" />
+  <Var name="KeepPublicApi" value="false" />
+  <Var name="RenameProperties" value="true" />
+  <Var name="RenameEvents" value="true" />
+  <Var name="RenameFields" value="true" />
+  <Var name="RenameMethods" value="true" />
+  <Var name="RenameParameters" value="true" />
+  <Var name="EncryptStrings" value="true" />
+  <Var name="SuppressIldasm" value="true" />
+
+  <!-- Tu ejecutable principal -->
+  <Module file="$(InPath)\SACTIBACKUP.exe">
+
+    <!-- ❗ MUY IMPORTANTE: excluir WinForms Designer -->
+    <SkipNamespace name="SACTIBACKUP.Properties" />
+    <SkipNamespace name="SACTIBACKUP.Resources" />
+    <SkipNamespace name="SACTIBACKUP.Views" />
+
+    <!-- Excluir formularios y designer -->
+    <SkipType name="*.Designer" />
+    <SkipType name="*Form" />
+    <SkipType name="*XtraForm" />
+
+    <!-- Excluir DevExpress -->
+    <SkipNamespace name="DevExpress" />
+    <SkipNamespace name="DevExpress.*" />
+
+    <!-- Excluir Program.cs -->
+    <SkipType name="Program" />
+
+  </Module>
+
+</Obfuscator>
