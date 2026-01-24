@@ -176,13 +176,53 @@ public partial class Configuraciones : Form
     {
         RealizarRespaldo = false;
 
-
         string rutaRespaldos = txtRutaRespaldos.Text?.Trim() ?? "";
         string passwordArchivos = txtPwdArchivos.Text ?? "";
         string passwordArchivosConfirm = txtPwdConfirm.Text ?? "";
         string aliasGlobal = txtAliasGlobal.Text?.Trim() ?? "";
         string correoNotificaciones = txtCorreoNotificaciones.Text?.Trim() ?? "";
-        string horaRespaldo = timeHoraRespaldo.Text?.Trim() ?? "00:00:00";
+
+        // Obtener hora de respaldo desde el TimeEdit correctamente
+        string horaRespaldo;
+        try
+        {
+            // Usar la propiedad Time del TimeEdit de DevExpress
+            var timeValue = timeHoraRespaldo.Time;
+            horaRespaldo = timeValue.ToString("HH:mm:ss");
+        }
+        catch
+        {
+            try
+            {
+                // Fallback: intentar con EditValue
+                if (timeHoraRespaldo.EditValue is DateTime dt)
+                {
+                    horaRespaldo = dt.ToString("HH:mm:ss");
+                }
+                else if (timeHoraRespaldo.EditValue is TimeSpan ts)
+                {
+                    horaRespaldo = ts.ToString(@"hh\:mm\:ss");
+                }
+                else
+                {
+                    // Último recurso: parsear el texto con cultura invariante
+                    var textoHora = timeHoraRespaldo.Text?.Trim() ?? "00:00:00";
+                    if (DateTime.TryParse(textoHora, System.Globalization.CultureInfo.CurrentCulture,
+                        System.Globalization.DateTimeStyles.None, out DateTime parsed))
+                    {
+                        horaRespaldo = parsed.ToString("HH:mm:ss");
+                    }
+                    else
+                    {
+                        horaRespaldo = "00:00:00";
+                    }
+                }
+            }
+            catch
+            {
+                horaRespaldo = "00:00:00";
+            }
+        }
 
         bool respaldarSQL = chkRespaldarSQL.Checked;
         bool respaldarFireBird = chkRespaldarFirebird.Checked;
@@ -193,7 +233,6 @@ public partial class Configuraciones : Form
         string correoFTP = txtUsuario.Text?.Trim().ToUpperInvariant() ?? "";
         string passwordFTP = txtContrasenha.Text ?? "";
 
-        
         if (string.IsNullOrWhiteSpace(rutaRespaldos) ||
             string.IsNullOrWhiteSpace(passwordArchivos) ||
             string.IsNullOrWhiteSpace(passwordArchivosConfirm) ||
@@ -210,8 +249,8 @@ public partial class Configuraciones : Form
             return;
         }
 
-        
-        if (!Regex.IsMatch(horaRespaldo, @"^\d{1,2}:\d{2}:\d{2}$"))
+        // Validar formato de hora (ya normalizado a HH:mm:ss)
+        if (!Regex.IsMatch(horaRespaldo, @"^\d{2}:\d{2}:\d{2}$"))
         {
             MessageBox.Show("Hora de respaldo inválida. Use formato HH:MM:SS");
             return;
@@ -487,7 +526,24 @@ public partial class Configuraciones : Form
         txtPwdConfirm.Text = (string?)obj["PasswordConfirm"] ?? "";
         txtAliasGlobal.Text = (string?)obj["AliasGlobal"] ?? "";
         txtCorreoNotificaciones.Text = (string?)obj["CorreoNotificaciones"] ?? "";
-        timeHoraRespaldo.EditValue = (string?)obj["HoraRespaldo"] ?? "00:00:00";
+
+        // Cargar hora de respaldo correctamente
+        var horaStr = (string?)obj["HoraRespaldo"] ?? "00:00:00";
+        try
+        {
+            if (TimeSpan.TryParse(horaStr, out TimeSpan ts))
+            {
+                timeHoraRespaldo.EditValue = DateTime.Today.Add(ts);
+            }
+            else
+            {
+                timeHoraRespaldo.EditValue = DateTime.Today;
+            }
+        }
+        catch
+        {
+            timeHoraRespaldo.EditValue = DateTime.Today;
+        }
 
         txtUsuario.Text = (string?)obj["CorreoFTP"] ?? "";
         txtContrasenha.Text = (string?)obj["PasswordFTP"] ?? "";

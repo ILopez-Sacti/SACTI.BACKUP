@@ -21,23 +21,27 @@ namespace SACTIBACKUP.Infrastructure
         private static readonly List<string> _erroresFb = new();
         private static bool _errorFtp;
 
-       
+
         public static async Task EvaluateAndRunAsync()
         {
             _erroresSql.Clear();
             _erroresFb.Clear();
             _errorFtp = false;
 
+            BackupProgressReporter.ReportInitializing("Iniciando proceso de respaldo...");
+
             var cfgObj = ConfigManager.Load();
             var cfg = BackupConfigMapper.FromJObject(cfgObj);
 
-        
+            BackupProgressReporter.Report(BackupStage.Initializing, $"Validando licencia para '{cfg.CorreoFTP}'...", 2);
             var lic = await LicenseService.ObtenerPorUsuarioAsync(cfg.CorreoFTP.ToUpperInvariant());
             if (lic is null)
             {
+                var errorMsg = LicenseService.LastError ?? "Error desconocido al validar licencia";
+                BackupProgressReporter.ReportError(errorMsg);
                 EmailService.SendBackupResult(
                     error: true,
-                    mensaje: "No se pudo validar licencia (sin datos).",
+                    mensaje: $"No se pudo validar licencia: {errorMsg}",
                     nota: "Ponerse en contacto con su proveedor de servicio de respaldo.",
                     nombreEmpresa: cfg.CorreoFTP.Equals("GENERALSAC", StringComparison.OrdinalIgnoreCase) ? "General SACTI" : (cfg.AliasGlobal ?? "SACTI"),
                     correoEmisor: "backup@sacti.mx",
@@ -48,6 +52,7 @@ namespace SACTIBACKUP.Infrastructure
             }
             if (lic.LicenciaVencida)
             {
+                BackupProgressReporter.ReportError("Licencia vencida");
                 EmailService.SendBackupResult(
                     error: true,
                     mensaje: "No se puede realizar el respaldo de su información debido a que su licencia ha caducado.",
@@ -60,18 +65,24 @@ namespace SACTIBACKUP.Infrastructure
                 return;
             }
 
-          
+
             var hoy = DateTime.Today;
             var ultimoLocal = cfg.FechaUltimoRespaldo;
             var diff = ultimoLocal.HasValue ? (hoy - ultimoLocal.Value.Date).TotalDays : double.MaxValue;
-            if (diff < lic.RespaldarCada) return;
 
-         
+            if (diff < lic.RespaldarCada)
+            {
+                BackupProgressReporter.Report(BackupStage.Completed,
+                    $"No es necesario respaldar. Último respaldo: {ultimoLocal?.ToString("dd/MM/yyyy") ?? "Nunca"}. Próximo en {lic.RespaldarCada - (int)diff} día(s).", 100);
+                return;
+            }
+
+            BackupProgressReporter.Report(BackupStage.Initializing, "Iniciando respaldo de bases de datos...", 5);
             await ExecuteBackupAsync(cfg).ConfigureAwait(false);
 
-         
             if (cfg.RespaldarNube)
             {
+                BackupProgressReporter.ReportRotation();
                 await FtpRotationService.ApplyPoliciesAsync(
                     host: "sacti.ddns.net",
                     usuario: cfg.CorreoFTP,
@@ -147,9 +158,11 @@ namespace SACTIBACKUP.Infrastructure
                 passwordElEmisor: "K0fxKheC{hV*",
                 correoReceptorCliente: lic?.CorreoNotificacion ?? cfg.CorreoNotificaciones ?? ""
             );
+
+            BackupProgressReporter.ReportCompleted();
         }
 
-     
+
         public static async Task ExecuteBackupAsync(BackupConfig cfg)
         {
             await Task.Run(async () =>
@@ -159,49 +172,81 @@ namespace SACTIBACKUP.Infrastructure
                 var pathBase = Path.Combine(cfg.RutaRespaldo, fechaCarpeta);
                 Directory.CreateDirectory(pathBase);
 
-             
-                if (cfg.RespaldarSQL)
+                // Respaldo SQL
+                if (cfg.RespaldarSQL && cfg.ListaInstanciasSQL.Count > 0)
                 {
+                    int totalInstances = cfg.ListaInstanciasSQL.Count;
+                    int currentInstance = 0;
+
                     foreach (var raw in cfg.ListaInstanciasSQL)
                     {
+                        currentInstance++;
                         var p = raw.Split('+');
                         var servidor = p.ElementAtOrDefault(0) ?? "";
                         var instancia = p.ElementAtOrDefault(1) ?? "DEFAULT";
                         var usuario = p.ElementAtOrDefault(2) ?? "";
                         var contrasenha = p.ElementAtOrDefault(3) ?? "";
 
+                        BackupProgressReporter.ReportSQL($"{servidor}\\{instancia}", currentInstance, totalInstances);
                         await BackupSqlInstanceAsync(servidor, instancia, usuario, contrasenha, pathBase, cfg).ConfigureAwait(false);
                     }
                 }
 
-            
-                if (cfg.RespaldarFireBird)
+                // Respaldo Firebird
+                if (cfg.RespaldarFireBird && cfg.ListaRutaFireBird.Count > 0)
                 {
+                    int totalFb = cfg.ListaRutaFireBird.Count;
+                    int currentFb = 0;
+
                     foreach (var fb in cfg.ListaRutaFireBird)
                     {
+                        currentFb++;
                         var parts = fb.Split('+');
                         var ruta = parts.ElementAtOrDefault(0) ?? "";
                         var alias = parts.ElementAtOrDefault(1) ?? "";
 
+                        BackupProgressReporter.ReportFirebird(alias, currentFb, totalFb);
                         await BackupFirebirdAsync(ruta, alias, pathBase, cfg).ConfigureAwait(false);
                     }
                 }
 
-              
+                // Subida a FTP
                 if (cfg.RespaldarNube)
                 {
-                    var ok = await UploadRarsToFtpAsync(pathBase, cfg).ConfigureAwait(false);
-                    if (!ok) _errorFtp = true;
+                    try
+                    {
+                        BackupProgressReporter.Report(BackupStage.UploadingToFTP, "Preparando subida a la nube...", 68);
+                        var ok = await UploadRarsToFtpAsync(pathBase, cfg).ConfigureAwait(false);
+                        if (!ok)
+                        {
+                            _errorFtp = true;
+                            BackupProgressReporter.ReportError("Error al subir archivos a la nube");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _errorFtp = true;
+                        BackupProgressReporter.ReportError($"Error FTP: {ex.Message}");
+                        System.Diagnostics.Debug.WriteLine($"Error FTP: {ex}");
+                    }
                 }
 
+                // Guardar fechas localmente
                 var obj = ConfigManager.Load();
                 var fLocal = new DateTime(today.Year, today.Month, today.Day);
                 obj["FechaUltimoRespaldo"] = fLocal;
-                if (cfg.RespaldarNube) obj["FechaUltimoRespaldoNube"] = fLocal;
+                if (cfg.RespaldarNube && !_errorFtp) obj["FechaUltimoRespaldoNube"] = fLocal;
                 ConfigManager.Save(obj);
 
-                await LicenseUpdates.UpdateLastBackupDatesAsync(cfg.CorreoFTP.ToUpperInvariant(), fLocal, cfg.RespaldarNube ? fLocal : (DateTime?)null)
-                    .ConfigureAwait(false);
+                try
+                {
+                    await LicenseUpdates.UpdateLastBackupDatesAsync(cfg.CorreoFTP.ToUpperInvariant(), fLocal, (cfg.RespaldarNube && !_errorFtp) ? fLocal : (DateTime?)null)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"Error actualizando fechas remotas: {ex}");
+                }
             }).ConfigureAwait(false);
         }
 
@@ -254,16 +299,26 @@ namespace SACTIBACKUP.Infrastructure
                     dbs.Add(rd.GetString(0));
             }
 
+            int totalDbs = dbs.Count;
+            int currentDbIndex = 0;
+
             foreach (var db in dbs)
             {
+                currentDbIndex++;
                 try
                 {
-               
+                    // Reportar progreso con nombre de BD
+                    int percent = (int)(5 + (35.0 * currentDbIndex / totalDbs)); // SQL usa 5-40%
+                    BackupProgressReporter.Report(BackupStage.BackupSQL,
+                        $"Respaldando SQL [{currentDbIndex}/{totalDbs}]: {db}",
+                        percent, db, currentDbIndex, totalDbs);
+
                     var bakPath = Path.Combine(pathBase, $"{db}.bak");
                     var cmdBak = con.CreateCommand();
                     cmdBak.CommandTimeout = 0;
 
-                    var comp = (cfg.RespaldarNube && !express) ? ", COMPRESSION" : "";
+                    // Usar COMPRESSION solo si: usuario lo habilitó Y no es Express Edition
+                    var comp = (cfg.BDComprimidas && !express) ? ", COMPRESSION" : "";
                     cmdBak.CommandText = $"BACKUP DATABASE [{db}] TO DISK=@p WITH FORMAT, INIT{comp}, SKIP, NOREWIND, NOUNLOAD, MEDIADESCRIPTION=@d";
                     cmdBak.Parameters.AddWithValue("@p", bakPath);
                     cmdBak.Parameters.AddWithValue("@d", $"Backup de la base de datos: {db} {DateTime.Now:yyyyMMdd}");
@@ -281,7 +336,7 @@ namespace SACTIBACKUP.Infrastructure
                         var pData = await GetParametrosContpaqAsync(con, db).ConfigureAwait(false);
                         if (pData.HasGuidDsl)
                         {
-                            var special = await BackupSpecialDatabasesAsync(con, pathBase, instancia, cfg, pData.GuidDsl)
+                            var special = await BackupSpecialDatabasesAsync(con, pathBase, instancia, cfg, pData.GuidDsl, express)
                                 .ConfigureAwait(false);
 
                         
@@ -312,7 +367,7 @@ namespace SACTIBACKUP.Infrastructure
 
                         if (!string.IsNullOrWhiteSpace(nData.GuidDsl))
                         {
-                            var special = await BackupSpecialDatabasesAsync(con, pathBase, instancia, cfg, nData.GuidDsl)
+                            var special = await BackupSpecialDatabasesAsync(con, pathBase, instancia, cfg, nData.GuidDsl, express)
                                 .ConfigureAwait(false);
 
                            
@@ -343,7 +398,7 @@ namespace SACTIBACKUP.Infrastructure
 
                         if (!string.IsNullOrWhiteSpace(cData.CGuidDSL))
                         {
-                            var special = await BackupSpecialDatabasesAsync(con, pathBase, instancia, cfg, cData.CGuidDSL)
+                            var special = await BackupSpecialDatabasesAsync(con, pathBase, instancia, cfg, cData.CGuidDSL, express)
                                 .ConfigureAwait(false);
 
                             special.InnerZipPath = Path.Combine(pathBase, $"{db}.zip");
@@ -480,35 +535,87 @@ namespace SACTIBACKUP.Infrastructure
         {
             try
             {
+                // Verificar que el directorio exista
+                if (!Directory.Exists(pathBase))
+                {
+                    BackupProgressReporter.ReportError($"El directorio no existe: {pathBase}");
+                    return false;
+                }
+
                 var rarFiles = Directory.EnumerateFiles(pathBase, "*.rar", SearchOption.TopDirectoryOnly).ToList();
+                int totalFiles = rarFiles.Count;
+
+                // Si no hay archivos para subir
+                if (totalFiles == 0)
+                {
+                    BackupProgressReporter.Report(BackupStage.UploadingToFTP, "No hay archivos para subir a la nube", 95);
+                    return true; // No es un error, simplemente no hay nada que subir
+                }
+
+                int currentFileIndex = 0;
+
                 foreach (var archivo in rarFiles)
                 {
+                    currentFileIndex++;
                     var nombre = Path.GetFileName(archivo);
                     var folder = $"ftp://sacti.ddns.net//{cfg.CorreoFTP.ToUpperInvariant()}";
                     var fileUri = $"{folder}//{nombre}";
 
-                    var request = (FtpWebRequest)WebRequest.Create(fileUri);
-                    request.Method = WebRequestMethods.Ftp.UploadFile;
-                    request.Credentials = new NetworkCredential(cfg.CorreoFTP, cfg.PasswordFTP);
-                    request.UsePassive = true;
-                    request.UseBinary = true;
-                    request.KeepAlive = false;
-                    request.Timeout = 10 * 60 * 1000;        // 10 minutos
-                    request.ReadWriteTimeout = 10 * 60 * 1000;
-                    //request.ReadWriteTimeout = 200000;
+                    BackupProgressReporter.ReportUploading(nombre, currentFileIndex, totalFiles, 0);
 
-                    using var fileStream = File.OpenRead(archivo);
-                    
-                    using (var reqStream = await request.GetRequestStreamAsync().ConfigureAwait(false))
+                    try
                     {
-                        await fileStream.CopyToAsync(reqStream).ConfigureAwait(false);
-                        reqStream.Close();
+                        var request = (FtpWebRequest)WebRequest.Create(fileUri);
+                        request.Method = WebRequestMethods.Ftp.UploadFile;
+                        request.Credentials = new NetworkCredential(cfg.CorreoFTP, cfg.PasswordFTP);
+                        request.UsePassive = true;
+                        request.UseBinary = true;
+                        request.KeepAlive = false;
+                        request.Timeout = 10 * 60 * 1000;        // 10 minutos
+                        request.ReadWriteTimeout = 10 * 60 * 1000;
+
+                        var fileInfo = new FileInfo(archivo);
+                        long totalBytes = fileInfo.Length;
+                        long bytesSent = 0;
+
+                        using var fileStream = File.OpenRead(archivo);
+                        using (var reqStream = await request.GetRequestStreamAsync().ConfigureAwait(false))
+                        {
+                            var buffer = new byte[81920]; // 80KB buffer
+                            int bytesRead;
+                            int lastReportedPercent = 0;
+
+                            while ((bytesRead = await fileStream.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0)
+                            {
+                                await reqStream.WriteAsync(buffer, 0, bytesRead).ConfigureAwait(false);
+                                bytesSent += bytesRead;
+
+                                int percent = totalBytes > 0 ? (int)((bytesSent * 100) / totalBytes) : 0;
+                                if (percent >= lastReportedPercent + 2) // Reportar cada 2%
+                                {
+                                    lastReportedPercent = percent;
+                                    BackupProgressReporter.ReportUploading(nombre, currentFileIndex, totalFiles, percent);
+                                }
+                            }
+
+                            reqStream.Close();
+                        }
+
+                        BackupProgressReporter.ReportUploading(nombre, currentFileIndex, totalFiles, 100);
+
+                        using var resp = (FtpWebResponse)await request.GetResponseAsync().ConfigureAwait(false);
+                        resp.Close();
                     }
-                    using var resp = (FtpWebResponse)await request.GetResponseAsync().ConfigureAwait(false);
-                    resp.Close();
+                    catch (Exception exFile)
+                    {
+                        BackupProgressReporter.ReportError($"Error subiendo {nombre}: {exFile.Message}");
+                        System.Diagnostics.Debug.WriteLine($"Error subiendo {nombre}: {exFile}");
+                        // Continuar con el siguiente archivo
+                    }
                 }
 
-          
+                // Verificar y limpiar archivos subidos
+                BackupProgressReporter.Report(BackupStage.UploadingToFTP, "Verificando archivos subidos...", 94);
                 foreach (var archivo in rarFiles)
                 {
                     try
@@ -537,8 +644,10 @@ namespace SACTIBACKUP.Infrastructure
 
                 return true;
             }
-            catch
+            catch (Exception ex)
             {
+                BackupProgressReporter.ReportError($"Error en subida FTP: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"Error en UploadRarsToFtpAsync: {ex}");
                 return false;
             }
         }
@@ -689,7 +798,7 @@ namespace SACTIBACKUP.Infrastructure
             return res;
         }
 
-        private static async Task<SpecialPack> BackupSpecialDatabasesAsync(SqlConnection con, string pathBase, string instancia, BackupConfig cfg, string guidDsl)
+        private static async Task<SpecialPack> BackupSpecialDatabasesAsync(SqlConnection con, string pathBase, string instancia, BackupConfig cfg, string guidDsl, bool isExpressEdition)
         {
             var guid = guidDsl.ToLowerInvariant();
 
@@ -718,12 +827,13 @@ namespace SACTIBACKUP.Infrastructure
                 return val == 1;
             }
 
-          
+
             async Task BackupDbAsync(string name, string targetBak)
             {
                 if (!await DbExistsAsync(name).ConfigureAwait(false)) return;
                 var cmdBak = con.CreateCommand();
-                var comp = (cfg.RespaldarNube) ? ", COMPRESSION" : ""; // si es Express, SQL ignora COMPRESSION
+                // Usar COMPRESSION solo si: usuario lo habilitó Y no es Express Edition
+                var comp = (cfg.BDComprimidas && !isExpressEdition) ? ", COMPRESSION" : "";
                 cmdBak.CommandText = $"BACKUP DATABASE [{name}] TO DISK=@p WITH FORMAT, INIT{comp}";
                 cmdBak.Parameters.AddWithValue("@p", targetBak);
                 await cmdBak.ExecuteNonQueryAsync().ConfigureAwait(false);

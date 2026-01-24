@@ -51,7 +51,7 @@ namespace SACTIBACKUP.Infrastructure
                         : $"{nombreEmpresa} Su respaldo fue realizado con éxito!!",
                 };
 
-               
+               ///
                 if (mensaje == "No se puede realizar el respaldo de su información debido a que su licencia ha caducado.")
                     mail.Subject = "Error en licencia";
 
