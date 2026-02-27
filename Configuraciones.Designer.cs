@@ -34,6 +34,7 @@
             tableLayoutPanel1 = new TableLayoutPanel();
             panel4 = new Panel();
             panel7 = new Panel();
+            chkIniciarConWindows = new DevExpress.XtraEditors.CheckEdit();
             chkUsarRazonSocial = new DevExpress.XtraEditors.CheckEdit();
             chkRespaldarNube = new DevExpress.XtraEditors.CheckEdit();
             chkComprimidas = new DevExpress.XtraEditors.CheckEdit();
@@ -101,6 +102,7 @@
             tableLayoutPanel1.SuspendLayout();
             panel4.SuspendLayout();
             panel7.SuspendLayout();
+            ((System.ComponentModel.ISupportInitialize)chkIniciarConWindows.Properties).BeginInit();
             ((System.ComponentModel.ISupportInitialize)chkUsarRazonSocial.Properties).BeginInit();
             ((System.ComponentModel.ISupportInitialize)chkRespaldarNube.Properties).BeginInit();
             ((System.ComponentModel.ISupportInitialize)chkComprimidas.Properties).BeginInit();
@@ -184,6 +186,7 @@
             // 
             // panel7
             // 
+            panel7.Controls.Add(chkIniciarConWindows);
             panel7.Controls.Add(chkUsarRazonSocial);
             panel7.Controls.Add(chkRespaldarNube);
             panel7.Controls.Add(chkComprimidas);
@@ -206,7 +209,18 @@
             chkUsarRazonSocial.Properties.Caption = "Usar Razón Social";
             chkUsarRazonSocial.Size = new Size(156, 24);
             chkUsarRazonSocial.TabIndex = 22;
-            // 
+            //
+            // chkIniciarConWindows
+            //
+            chkIniciarConWindows.EditValue = true;
+            chkIniciarConWindows.Location = new Point(33, 145);
+            chkIniciarConWindows.Name = "chkIniciarConWindows";
+            chkIniciarConWindows.Properties.Appearance.Font = new Font("Microsoft Sans Serif", 12F);
+            chkIniciarConWindows.Properties.Appearance.Options.UseFont = true;
+            chkIniciarConWindows.Properties.Caption = "Iniciar con Windows";
+            chkIniciarConWindows.Size = new Size(180, 24);
+            chkIniciarConWindows.TabIndex = 23;
+            //
             // chkRespaldarNube
             // 
             chkRespaldarNube.EditValue = true;
@@ -907,6 +921,7 @@
             tableLayoutPanel1.ResumeLayout(false);
             panel4.ResumeLayout(false);
             panel7.ResumeLayout(false);
+            ((System.ComponentModel.ISupportInitialize)chkIniciarConWindows.Properties).EndInit();
             ((System.ComponentModel.ISupportInitialize)chkUsarRazonSocial.Properties).EndInit();
             ((System.ComponentModel.ISupportInitialize)chkRespaldarNube.Properties).EndInit();
             ((System.ComponentModel.ISupportInitialize)chkComprimidas.Properties).EndInit();
@@ -1015,5 +1030,6 @@
         private Button btnMostrarPwdSqL;
         private Button btnMostrarPwdArchivos;
         private Button btnMostrarPwdArchivosConfirm;
+        private DevExpress.XtraEditors.CheckEdit chkIniciarConWindows;
     }
 }

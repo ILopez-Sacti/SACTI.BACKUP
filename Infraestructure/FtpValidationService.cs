@@ -8,7 +8,7 @@ using System.Threading.Tasks;
 namespace SACTIBACKUP.Infrastructure
 {
     /// <summary>
-    /// Valida credenciales FTP haciendo un ListDirectory al host indicado.
+    /// Valida credenciales FTP haciendo un PrintWorkingDirectory al host indicado.
     /// </summary>
     public static class FtpValidationService
     {
@@ -25,7 +25,7 @@ namespace SACTIBACKUP.Infrastructure
                             : $"ftp://{host}";
 
             var request = (FtpWebRequest)WebRequest.Create(new Uri(uriString));
-            request.Method = WebRequestMethods.Ftp.ListDirectory;
+            request.Method = WebRequestMethods.Ftp.PrintWorkingDirectory;
             request.Credentials = new NetworkCredential(usuario, password);
             request.UsePassive = true;
             request.EnableSsl = useSsl;   

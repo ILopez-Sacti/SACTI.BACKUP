@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dotnet build:*)",
+      "Bash(schtasks:*)",
+      "Bash(cmd //c 'schtasks /query /tn \"\"SACTI Backup\"\"')",
+      "Bash(cmd //c \"schtasks /query /tn \"\"SACTI Backup\"\"\")",
+      "Bash(powershell -Command \"schtasks /query /tn ''SACTI Backup''\")"
+    ]
+  }
+}

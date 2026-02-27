@@ -20,6 +20,8 @@ namespace SACTIBACKUP.Infrastructure
         private static readonly List<string> _erroresSql = new();
         private static readonly List<string> _erroresFb = new();
         private static bool _errorFtp;
+        private static readonly HashSet<string> _specialDbsBackedUp = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly List<string> _diagnosticLog = new();
 
 
         public static async Task EvaluateAndRunAsync()
@@ -27,6 +29,8 @@ namespace SACTIBACKUP.Infrastructure
             _erroresSql.Clear();
             _erroresFb.Clear();
             _errorFtp = false;
+            _specialDbsBackedUp.Clear();
+            _diagnosticLog.Clear();
 
             BackupProgressReporter.ReportInitializing("Iniciando proceso de respaldo...");
 
@@ -314,25 +318,14 @@ namespace SACTIBACKUP.Infrastructure
                         percent, db, currentDbIndex, totalDbs);
 
                     var bakPath = Path.Combine(pathBase, $"{db}.bak");
-                    var cmdBak = con.CreateCommand();
-                    cmdBak.CommandTimeout = 0;
-
-                    // Usar COMPRESSION solo si: usuario lo habilitó Y no es Express Edition
-                    var comp = (cfg.BDComprimidas && !express) ? ", COMPRESSION" : "";
-                    cmdBak.CommandText = $"BACKUP DATABASE [{db}] TO DISK=@p WITH FORMAT, INIT{comp}, SKIP, NOREWIND, NOUNLOAD, MEDIADESCRIPTION=@d";
-                    cmdBak.Parameters.AddWithValue("@p", bakPath);
-                    cmdBak.Parameters.AddWithValue("@d", $"Backup de la base de datos: {db} {DateTime.Now:yyyyMMdd}");
-                   
-
-
-                    await cmdBak.ExecuteNonQueryAsync().ConfigureAwait(false);
+                    await BackupDatabaseWithRetryAsync(con, db, bakPath, cfg, express).ConfigureAwait(false);
 
                   
                     var tablas = await GetTablesAsync(con, db).ConfigureAwait(false);
 
                     if (tablas.Contains("Parametros"))
                     {
-                    
+                        _diagnosticLog.Add($"[DETECCION] BD={db} -> Tipo CONTPAQ (tabla Parametros encontrada)");
                         var pData = await GetParametrosContpaqAsync(con, db).ConfigureAwait(false);
                         if (pData.HasGuidDsl)
                         {
@@ -355,6 +348,7 @@ namespace SACTIBACKUP.Infrastructure
                         }
                         else
                         {
+                            _diagnosticLog.Add($"[DETECCION] BD={db} -> CONTPAQ pero GUIDDSL vacio, respaldo como generica");
                             await CompressSingleAsync(pathBase, $"{cfg.AliasGlobal}-{instancia}{db}{DateTime.Now:yyyyMMdd}.rar",
                                                       new[] { bakPath }, cfg.PasswordArchivos).ConfigureAwait(false);
                             SafeDelete(bakPath);
@@ -362,7 +356,7 @@ namespace SACTIBACKUP.Infrastructure
                     }
                     else if (tablas.Contains("NOM10000"))
                     {
-                     
+                        _diagnosticLog.Add($"[DETECCION] BD={db} -> Tipo NOMINA (tabla NOM10000 encontrada)");
                         var nData = await GetParametrosNominaAsync(con, db).ConfigureAwait(false);
 
                         if (!string.IsNullOrWhiteSpace(nData.GuidDsl))
@@ -386,6 +380,7 @@ namespace SACTIBACKUP.Infrastructure
                         }
                         else
                         {
+                            _diagnosticLog.Add($"[DETECCION] BD={db} -> NOMINA pero GUIDDSL vacio, respaldo como generica");
                             await CompressSingleAsync(pathBase, $"{cfg.AliasGlobal}-{instancia}{db}{DateTime.Now:yyyyMMdd}.rar",
                                                       new[] { bakPath }, cfg.PasswordArchivos).ConfigureAwait(false);
                             SafeDelete(bakPath);
@@ -393,7 +388,7 @@ namespace SACTIBACKUP.Infrastructure
                     }
                     else if (tablas.Contains("admParametros"))
                     {
-                  
+                        _diagnosticLog.Add($"[DETECCION] BD={db} -> Tipo COMERCIAL (tabla admParametros encontrada)");
                         var cData = await GetParametrosComercialAsync(con, db).ConfigureAwait(false);
 
                         if (!string.IsNullOrWhiteSpace(cData.CGuidDSL))
@@ -416,6 +411,7 @@ namespace SACTIBACKUP.Infrastructure
                         }
                         else
                         {
+                            _diagnosticLog.Add($"[DETECCION] BD={db} -> COMERCIAL pero CGUIDDSL vacio, respaldo como generica");
                             await CompressSingleAsync(pathBase, $"{cfg.AliasGlobal}-{instancia}{db}{DateTime.Now:yyyyMMdd}.rar",
                                                       new[] { bakPath }, cfg.PasswordArchivos).ConfigureAwait(false);
                             SafeDelete(bakPath);
@@ -423,7 +419,7 @@ namespace SACTIBACKUP.Infrastructure
                     }
                     else
                     {
-                       
+                        _diagnosticLog.Add($"[DETECCION] BD={db} -> Tipo GENERICA (sin tablas Parametros/NOM10000/admParametros)");
                         await CompressSingleAsync(pathBase, $"{cfg.AliasGlobal}-{instancia}{db}{DateTime.Now:yyyyMMdd}.rar",
                                                   new[] { bakPath }, cfg.PasswordArchivos).ConfigureAwait(false);
                         SafeDelete(bakPath);
@@ -432,10 +428,140 @@ namespace SACTIBACKUP.Infrastructure
                 catch (Exception ex)
                 {
                     _erroresSql.Add(string.Concat(db, ": ", ex.Message.ToString()));
+                    _diagnosticLog.Add($"[ERROR] BD={db} -> {ex.Message}");
                 }
             }
 
-   
+            // === SEGUNDA PASADA: respaldar document/other que no fueron cubiertos por el manejo especial ===
+            await BackupRemainingDocumentOtherAsync(con, pathBase, instancia, cfg, express).ConfigureAwait(false);
+
+            // Escribir log de diagnostico
+            WriteDiagnosticLog(pathBase);
+        }
+
+        /// <summary>
+        /// Ejecuta BACKUP DATABASE con reintento automático si falla por error 9002 (log lleno / bitmap diferencial).
+        /// Flujo: backup normal → liberar log → reintentar normal → COPY_ONLY como último recurso.
+        /// </summary>
+        private static async Task BackupDatabaseWithRetryAsync(SqlConnection con, string db, string bakPath, BackupConfig cfg, bool isExpressEdition)
+        {
+            var comp = (cfg.BDComprimidas && !isExpressEdition) ? ", COMPRESSION" : "";
+
+            try
+            {
+                var cmdBak = con.CreateCommand();
+                cmdBak.CommandTimeout = 0;
+                cmdBak.CommandText = $"BACKUP DATABASE [{db}] TO DISK=@p WITH FORMAT, INIT{comp}, SKIP, NOREWIND, NOUNLOAD, MEDIADESCRIPTION=@d";
+                cmdBak.Parameters.AddWithValue("@p", bakPath);
+                cmdBak.Parameters.AddWithValue("@d", $"Backup de la base de datos: {db} {DateTime.Now:yyyyMMdd}");
+                await cmdBak.ExecuteNonQueryAsync().ConfigureAwait(false);
+            }
+            catch (SqlException ex) when (IsLogFullError(ex))
+            {
+                _diagnosticLog.Add($"[RETRY] BD={db} -> Error 9002 (log lleno/bitmap diferencial). Intentando liberar log...");
+                SafeDelete(bakPath);
+
+                // Paso 1: Intentar liberar el transaction log
+                var logFreed = await TryShrinkTransactionLogAsync(con, db).ConfigureAwait(false);
+
+                if (logFreed)
+                {
+                    // Paso 2: Reintentar backup normal (ya con log liberado)
+                    try
+                    {
+                        var cmdRetry = con.CreateCommand();
+                        cmdRetry.CommandTimeout = 0;
+                        cmdRetry.CommandText = $"BACKUP DATABASE [{db}] TO DISK=@p WITH FORMAT, INIT{comp}, SKIP, NOREWIND, NOUNLOAD, MEDIADESCRIPTION=@d";
+                        cmdRetry.Parameters.AddWithValue("@p", bakPath);
+                        cmdRetry.Parameters.AddWithValue("@d", $"Backup (retry post-shrink): {db} {DateTime.Now:yyyyMMdd}");
+                        await cmdRetry.ExecuteNonQueryAsync().ConfigureAwait(false);
+
+                        _diagnosticLog.Add($"[RETRY] BD={db} -> Backup normal exitoso despues de liberar log");
+                        return;
+                    }
+                    catch (SqlException ex2)
+                    {
+                        _diagnosticLog.Add($"[RETRY] BD={db} -> Backup normal fallo aun despues de shrink: {ex2.Message}");
+                        SafeDelete(bakPath);
+                    }
+                }
+
+                // Paso 3: Último recurso - COPY_ONLY (no toca bitmap diferencial)
+                _diagnosticLog.Add($"[RETRY] BD={db} -> Intentando COPY_ONLY como ultimo recurso...");
+                var cmdCopy = con.CreateCommand();
+                cmdCopy.CommandTimeout = 0;
+                cmdCopy.CommandText = $"BACKUP DATABASE [{db}] TO DISK=@p WITH COPY_ONLY, FORMAT, INIT{comp}, SKIP, NOREWIND, NOUNLOAD, MEDIADESCRIPTION=@d";
+                cmdCopy.Parameters.AddWithValue("@p", bakPath);
+                cmdCopy.Parameters.AddWithValue("@d", $"Backup COPY_ONLY (retry 9002): {db} {DateTime.Now:yyyyMMdd}");
+                await cmdCopy.ExecuteNonQueryAsync().ConfigureAwait(false);
+
+                _diagnosticLog.Add($"[RETRY] BD={db} -> Backup COPY_ONLY exitoso");
+            }
+        }
+
+        private static bool IsLogFullError(SqlException ex)
+        {
+            return ex.Errors.Cast<SqlError>().Any(e => e.Number == 9002)
+                || ex.Message.Contains("9002")
+                || ex.Message.Contains("DIFFERENTIAL", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Intenta liberar el transaction log de una BD: guarda el recovery model original,
+        /// cambia a SIMPLE (lo que trunca el log), hace shrink del log file, y restaura el recovery model.
+        /// </summary>
+        private static async Task<bool> TryShrinkTransactionLogAsync(SqlConnection con, string db)
+        {
+            try
+            {
+                // Obtener recovery model actual
+                var cmdRecovery = con.CreateCommand();
+                cmdRecovery.CommandText = $"SELECT recovery_model_desc FROM sys.databases WHERE name = @db";
+                cmdRecovery.Parameters.AddWithValue("@db", db);
+                var recoveryModel = (string?)await cmdRecovery.ExecuteScalarAsync().ConfigureAwait(false) ?? "FULL";
+
+                _diagnosticLog.Add($"[SHRINK] BD={db} -> Recovery model actual: {recoveryModel}");
+
+                // Obtener nombre del archivo de log
+                var cmdLogFile = con.CreateCommand();
+                cmdLogFile.CommandText = $"SELECT name FROM [{db}].sys.database_files WHERE type_desc = 'LOG'";
+                var logFileName = (string?)await cmdLogFile.ExecuteScalarAsync().ConfigureAwait(false);
+
+                if (string.IsNullOrEmpty(logFileName))
+                {
+                    _diagnosticLog.Add($"[SHRINK] BD={db} -> No se encontro archivo de log, abortando");
+                    return false;
+                }
+
+                // Cambiar a SIMPLE para truncar el log
+                var cmdSimple = con.CreateCommand();
+                cmdSimple.CommandText = $"ALTER DATABASE [{db}] SET RECOVERY SIMPLE";
+                await cmdSimple.ExecuteNonQueryAsync().ConfigureAwait(false);
+
+                // Shrink del archivo de log
+                var cmdShrink = con.CreateCommand();
+                cmdShrink.CommandText = $"USE [{db}]; DBCC SHRINKFILE ([{logFileName}], 1)";
+                cmdShrink.CommandTimeout = 60;
+                await cmdShrink.ExecuteNonQueryAsync().ConfigureAwait(false);
+
+                _diagnosticLog.Add($"[SHRINK] BD={db} -> Log liberado exitosamente");
+
+                // Restaurar recovery model original
+                if (!recoveryModel.Equals("SIMPLE", StringComparison.OrdinalIgnoreCase))
+                {
+                    var cmdRestore = con.CreateCommand();
+                    cmdRestore.CommandText = $"ALTER DATABASE [{db}] SET RECOVERY {recoveryModel}";
+                    await cmdRestore.ExecuteNonQueryAsync().ConfigureAwait(false);
+                    _diagnosticLog.Add($"[SHRINK] BD={db} -> Recovery model restaurado a {recoveryModel}");
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _diagnosticLog.Add($"[SHRINK] BD={db} -> ERROR al liberar log: {ex.Message}");
+                return false;
+            }
         }
 
         private static async Task<HashSet<string>> GetTablesAsync(SqlConnection con, string db)
@@ -652,6 +778,90 @@ namespace SACTIBACKUP.Infrastructure
             }
         }
 
+        private static async Task BackupRemainingDocumentOtherAsync(SqlConnection con, string pathBase, string instancia, BackupConfig cfg, bool isExpressEdition)
+        {
+            try
+            {
+                var cmdDocOther = con.CreateCommand();
+                cmdDocOther.CommandText = @"
+                    SELECT name FROM sys.databases
+                    WHERE (name LIKE 'document[_]%' OR name LIKE 'other[_]%')
+                    ORDER BY name";
+
+                var allDocOther = new List<string>();
+                await using (var rd = await cmdDocOther.ExecuteReaderAsync().ConfigureAwait(false))
+                {
+                    while (await rd.ReadAsync().ConfigureAwait(false))
+                        allDocOther.Add(rd.GetString(0));
+                }
+
+                _diagnosticLog.Add($"[SEGUNDA PASADA] BDs document/other encontradas en servidor: {allDocOther.Count}");
+                foreach (var dbName in allDocOther)
+                    _diagnosticLog.Add($"  - {dbName} | Ya respaldada via especial: {_specialDbsBackedUp.Contains(dbName)}");
+
+                var pendientes = allDocOther.Where(d => !_specialDbsBackedUp.Contains(d)).ToList();
+
+                if (pendientes.Count == 0)
+                {
+                    _diagnosticLog.Add("[SEGUNDA PASADA] Todas las BDs document/other ya fueron respaldadas via manejo especial");
+                    return;
+                }
+
+                _diagnosticLog.Add($"[SEGUNDA PASADA] Respaldando {pendientes.Count} BDs document/other independientemente...");
+                int idx = 0;
+                foreach (var dbName in pendientes)
+                {
+                    idx++;
+                    try
+                    {
+                        BackupProgressReporter.Report(BackupStage.BackupSQL,
+                            $"Respaldando BD especial [{idx}/{pendientes.Count}]: {dbName}",
+                            40, dbName, idx, pendientes.Count);
+
+                        var bakPath = Path.Combine(pathBase, $"{dbName}.bak");
+                        await BackupDatabaseWithRetryAsync(con, dbName, bakPath, cfg, isExpressEdition).ConfigureAwait(false);
+
+                        var rarName = $"{cfg.AliasGlobal}-{instancia}{dbName}{DateTime.Now:yyyyMMdd}.rar";
+                        await CompressSingleAsync(pathBase, rarName, new[] { bakPath }, cfg.PasswordArchivos).ConfigureAwait(false);
+                        SafeDelete(bakPath);
+
+                        _diagnosticLog.Add($"[SEGUNDA PASADA] BD '{dbName}' respaldada OK independientemente");
+                    }
+                    catch (Exception ex)
+                    {
+                        _erroresSql.Add($"{dbName}: {ex.Message}");
+                        _diagnosticLog.Add($"[SEGUNDA PASADA] ERROR al respaldar '{dbName}': {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _diagnosticLog.Add($"[SEGUNDA PASADA] ERROR general: {ex.Message}");
+            }
+        }
+
+        private static void WriteDiagnosticLog(string pathBase)
+        {
+            try
+            {
+                var logDir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "SACTIBACKUP", "Logs");
+                Directory.CreateDirectory(logDir);
+
+                var logPath = Path.Combine(logDir, $"diagnostico_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+                var content = $"=== SACTI BACKUP - Log de Diagnostico ==={Environment.NewLine}"
+                            + $"Fecha: {DateTime.Now:yyyy-MM-dd HH:mm:ss}{Environment.NewLine}"
+                            + $"Ruta respaldo: {pathBase}{Environment.NewLine}"
+                            + $"BDs especiales respaldadas via manejo especial: {_specialDbsBackedUp.Count}{Environment.NewLine}"
+                            + $"========================================={Environment.NewLine}"
+                            + string.Join(Environment.NewLine, _diagnosticLog);
+
+                File.WriteAllText(logPath, content);
+            }
+            catch { /* no romper el proceso por un log */ }
+        }
+
         internal static class LicenseUpdates
         {
             public static async Task UpdateLastBackupDatesAsync(string usuarioFtp, DateTime fechaLocal, DateTime? fechaNube)
@@ -741,10 +951,18 @@ namespace SACTIBACKUP.Infrastructure
                     res.GuidDsl = rd.IsDBNull(0) ? "" : rd.GetString(0);
                     res.RFC = rd.IsDBNull(1) ? "" : rd.GetString(1);
                     res.GuidEmpresa = rd.IsDBNull(2) ? "" : rd.GetString(2);
-                    res.RazonSocial = db; // nombre BD como razón social cuando aplica
+                    res.RazonSocial = db;
+                    _diagnosticLog.Add($"[CONTPAQ] BD={db} | GUIDDSL='{res.GuidDsl}' | RFC='{res.RFC}' | GUIDEMPRESA='{res.GuidEmpresa}'");
+                }
+                else
+                {
+                    _diagnosticLog.Add($"[CONTPAQ] BD={db} | Tabla Parametros existe pero no tiene registros");
                 }
             }
-            catch { /* si no existe, se devuelve vacío */ }
+            catch (Exception ex)
+            {
+                _diagnosticLog.Add($"[CONTPAQ] BD={db} | ERROR al leer Parametros: {ex.Message}");
+            }
             return res;
         }
 
@@ -752,18 +970,41 @@ namespace SACTIBACKUP.Infrastructure
         private static async Task<NominaData> GetParametrosNominaAsync(SqlConnection con, string db)
         {
             var res = new NominaData();
-            var cmd = con.CreateCommand();
-            cmd.CommandText = $@"USE [{db}];
-                SELECT TOP 1 A.CNOMBREEMPRESA, A.GUIDDSL, A.GUIDEMPRESA, A.RFC
-                FROM (
-                    SELECT
-                        (SELECT TOP 1 CNOMBREEMPRESA FROM NOM10000) AS CNOMBREEMPRESA,
-                        (SELECT TOP 1 GUIDDSL        FROM NOM10000) AS GUIDDSL,
-                        (SELECT TOP 1 GUIDEMPRESA    FROM NOM10000) AS GUIDEMPRESA,
-                        (SELECT TOP 1 RFC            FROM NOM10000) AS RFC
-                ) A";
             try
             {
+                // Primero verificar qué columnas existen en NOM10000
+                var cmdCols = con.CreateCommand();
+                cmdCols.CommandText = $@"USE [{db}];
+                    SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_NAME = 'NOM10000'
+                      AND COLUMN_NAME IN ('CNOMBREEMPRESA','GUIDDSL','GUIDEMPRESA','RFC')";
+                var columnas = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                await using (var rdCols = await cmdCols.ExecuteReaderAsync().ConfigureAwait(false))
+                {
+                    while (await rdCols.ReadAsync().ConfigureAwait(false))
+                        columnas.Add(rdCols.GetString(0));
+                }
+
+                _diagnosticLog.Add($"[NOMINA] BD={db} | Columnas encontradas en NOM10000: {string.Join(", ", columnas)}");
+
+                if (!columnas.Contains("GUIDDSL"))
+                {
+                    _diagnosticLog.Add($"[NOMINA] BD={db} | NOM10000 no tiene columna GUIDDSL, se omite manejo especial");
+                    return res;
+                }
+
+                // Construir query solo con columnas que existan
+                var colNombre = columnas.Contains("CNOMBREEMPRESA")
+                    ? "(SELECT TOP 1 CNOMBREEMPRESA FROM NOM10000)"
+                    : "''";
+
+                var cmd = con.CreateCommand();
+                cmd.CommandText = $@"USE [{db}];
+                    SELECT TOP 1 {colNombre} AS CNOMBREEMPRESA,
+                        (SELECT TOP 1 GUIDDSL FROM NOM10000) AS GUIDDSL,
+                        (SELECT TOP 1 GUIDEMPRESA FROM NOM10000) AS GUIDEMPRESA,
+                        (SELECT TOP 1 RFC FROM NOM10000) AS RFC";
+
                 await using var rd = await cmd.ExecuteReaderAsync().ConfigureAwait(false);
                 if (await rd.ReadAsync().ConfigureAwait(false))
                 {
@@ -771,9 +1012,17 @@ namespace SACTIBACKUP.Infrastructure
                     res.GuidDsl = rd.IsDBNull(1) ? "" : rd.GetString(1);
                     res.GuidEmpresa = rd.IsDBNull(2) ? "" : rd.GetString(2);
                     res.RFC = rd.IsDBNull(3) ? "" : rd.GetString(3);
+                    _diagnosticLog.Add($"[NOMINA] BD={db} | GUIDDSL='{res.GuidDsl}' | RFC='{res.RFC}' | GUIDEMPRESA='{res.GuidEmpresa}'");
+                }
+                else
+                {
+                    _diagnosticLog.Add($"[NOMINA] BD={db} | Tabla NOM10000 existe pero no tiene registros");
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                _diagnosticLog.Add($"[NOMINA] BD={db} | ERROR al leer NOM10000: {ex.Message}");
+            }
             return res;
         }
 
@@ -792,9 +1041,17 @@ namespace SACTIBACKUP.Infrastructure
                     res.CGuidDSL = rd.IsDBNull(1) ? "" : rd.GetString(1);
                     res.CGuidEmpresa = rd.IsDBNull(2) ? "" : rd.GetString(2);
                     res.CRFCEmpresa = rd.IsDBNull(3) ? "" : rd.GetString(3);
+                    _diagnosticLog.Add($"[COMERCIAL] BD={db} | CGUIDDSL='{res.CGuidDSL}' | RFC='{res.CRFCEmpresa}' | CGUIDEMPRESA='{res.CGuidEmpresa}'");
+                }
+                else
+                {
+                    _diagnosticLog.Add($"[COMERCIAL] BD={db} | Tabla admParametros existe pero no tiene registros");
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                _diagnosticLog.Add($"[COMERCIAL] BD={db} | ERROR al leer admParametros: {ex.Message}");
+            }
             return res;
         }
 
@@ -807,6 +1064,8 @@ namespace SACTIBACKUP.Infrastructure
             var othMeta = $"other_{guid}_metadata";
             var othCont = $"other_{guid}_content";
 
+            _diagnosticLog.Add($"[SPECIAL] Intentando respaldar BDs especiales para GUID={guid}");
+
             var special = new SpecialPack
             {
                 DocumentMetadataBak = Path.Combine(pathBase, $"{docMeta}.bak"),
@@ -814,10 +1073,10 @@ namespace SACTIBACKUP.Infrastructure
                 OtherMetadataBak = Path.Combine(pathBase, $"{othMeta}.bak"),
                 OtherContentBak = Path.Combine(pathBase, $"{othCont}.bak"),
                 ControlJsonPath = Path.Combine(pathBase, "controlDocument.json"),
-                InnerZipPath = "" // se asigna fuera a {db}.zip
+                InnerZipPath = ""
             };
 
-         
+
             async Task<bool> DbExistsAsync(string name)
             {
                 var cmd = con.CreateCommand();
@@ -830,13 +1089,64 @@ namespace SACTIBACKUP.Infrastructure
 
             async Task BackupDbAsync(string name, string targetBak)
             {
-                if (!await DbExistsAsync(name).ConfigureAwait(false)) return;
-                var cmdBak = con.CreateCommand();
-                // Usar COMPRESSION solo si: usuario lo habilitó Y no es Express Edition
+                var exists = await DbExistsAsync(name).ConfigureAwait(false);
+                if (!exists)
+                {
+                    _diagnosticLog.Add($"[SPECIAL] BD '{name}' NO EXISTE en el servidor, se omite");
+                    return;
+                }
                 var comp = (cfg.BDComprimidas && !isExpressEdition) ? ", COMPRESSION" : "";
-                cmdBak.CommandText = $"BACKUP DATABASE [{name}] TO DISK=@p WITH FORMAT, INIT{comp}";
-                cmdBak.Parameters.AddWithValue("@p", targetBak);
-                await cmdBak.ExecuteNonQueryAsync().ConfigureAwait(false);
+
+                try
+                {
+                    var cmdBak = con.CreateCommand();
+                    cmdBak.CommandTimeout = 0;
+                    cmdBak.CommandText = $"BACKUP DATABASE [{name}] TO DISK=@p WITH FORMAT, INIT{comp}";
+                    cmdBak.Parameters.AddWithValue("@p", targetBak);
+                    await cmdBak.ExecuteNonQueryAsync().ConfigureAwait(false);
+                }
+                catch (SqlException ex) when (IsLogFullError(ex))
+                {
+                    _diagnosticLog.Add($"[SPECIAL-RETRY] BD '{name}' -> Error 9002. Intentando liberar log...");
+                    SafeDelete(targetBak);
+
+                    var logFreed = await TryShrinkTransactionLogAsync(con, name).ConfigureAwait(false);
+
+                    if (logFreed)
+                    {
+                        try
+                        {
+                            var cmdRetry = con.CreateCommand();
+                            cmdRetry.CommandTimeout = 0;
+                            cmdRetry.CommandText = $"BACKUP DATABASE [{name}] TO DISK=@p WITH FORMAT, INIT{comp}";
+                            cmdRetry.Parameters.AddWithValue("@p", targetBak);
+                            await cmdRetry.ExecuteNonQueryAsync().ConfigureAwait(false);
+
+                            _diagnosticLog.Add($"[SPECIAL-RETRY] BD '{name}' -> Backup normal exitoso despues de liberar log");
+                            _specialDbsBackedUp.Add(name);
+                            _diagnosticLog.Add($"[SPECIAL] BD '{name}' respaldada OK via manejo especial");
+                            return;
+                        }
+                        catch (SqlException ex2)
+                        {
+                            _diagnosticLog.Add($"[SPECIAL-RETRY] BD '{name}' -> Fallo aun despues de shrink: {ex2.Message}");
+                            SafeDelete(targetBak);
+                        }
+                    }
+
+                    // Último recurso: COPY_ONLY
+                    _diagnosticLog.Add($"[SPECIAL-RETRY] BD '{name}' -> Intentando COPY_ONLY...");
+                    var cmdCopy = con.CreateCommand();
+                    cmdCopy.CommandTimeout = 0;
+                    cmdCopy.CommandText = $"BACKUP DATABASE [{name}] TO DISK=@p WITH COPY_ONLY, FORMAT, INIT{comp}";
+                    cmdCopy.Parameters.AddWithValue("@p", targetBak);
+                    await cmdCopy.ExecuteNonQueryAsync().ConfigureAwait(false);
+
+                    _diagnosticLog.Add($"[SPECIAL-RETRY] BD '{name}' -> Backup COPY_ONLY exitoso");
+                }
+
+                _specialDbsBackedUp.Add(name);
+                _diagnosticLog.Add($"[SPECIAL] BD '{name}' respaldada OK via manejo especial");
             }
 
             await BackupDbAsync(docMeta, special.DocumentMetadataBak).ConfigureAwait(false);

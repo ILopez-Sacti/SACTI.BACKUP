@@ -36,6 +36,7 @@ public partial class Configuraciones : Form
         chkRespaldarNube.Checked = true;
         chkUsarRazonSocial.Checked = true;
         chkComprimidas.Checked = true;
+        chkIniciarConWindows.Checked = true;
 
         gcInstanciasSQL.DataSource = _sqlList;
         gcBDDFireBird.DataSource = _fbList;
@@ -390,6 +391,7 @@ public partial class Configuraciones : Form
             jsonObj.RespaldarNube = respaldarNube ? "SI" : "NO";
             jsonObj.BDComprimidas = bdComprimidas ? "SI" : "NO";
             jsonObj.UsarRazonSocial = usarRazonSocial ? "SI" : "NO";
+            jsonObj.IniciarConWindows = chkIniciarConWindows.Checked ? "SI" : "NO";
 
             jsonObj.listaRutaFireBird = JToken.FromObject(listaRutasJSON);
             jsonObj.listaInstanciasSQL = JToken.FromObject(listaInstanciasJSON);
@@ -405,6 +407,22 @@ public partial class Configuraciones : Form
             jsonObj.LicenciaVencida = licenciaVencida;
 
             ConfigManager.Save(jsonObj);
+
+            // Registrar/desregistrar tarea de inicio con Windows
+            if (chkIniciarConWindows.Checked)
+            {
+                var (ok, error) = StartupTaskService.Register();
+                if (!ok)
+                    MessageBox.Show($"No se pudo registrar el inicio con Windows: {error}", "Aviso",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            else
+            {
+                var (ok, error) = StartupTaskService.Unregister();
+                if (!ok)
+                    MessageBox.Show($"No se pudo desregistrar el inicio con Windows: {error}", "Aviso",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
 
             acepto = true;
            
@@ -553,6 +571,9 @@ public partial class Configuraciones : Form
         chkRespaldarNube.Checked = ((string?)obj["RespaldarNube"]) == "SI";
         chkComprimidas.Checked = ((string?)obj["BDComprimidas"]) == "SI";
         chkUsarRazonSocial.Checked = ((string?)obj["UsarRazonSocial"]) == "SI";
+
+        var iniciarConWindows = (string?)obj["IniciarConWindows"];
+        chkIniciarConWindows.Checked = iniciarConWindows == null || iniciarConWindows == "SI";
 
         // Cargar listas en grids
         _fbList.Clear();
