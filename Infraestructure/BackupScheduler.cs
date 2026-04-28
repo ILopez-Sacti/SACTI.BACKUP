@@ -1,4 +1,4 @@
-﻿
+
 // Infrastructure/BackupScheduler.cs
 #nullable enable
 using System;
@@ -36,11 +36,26 @@ namespace SACTIBACKUP.Infrastructure
             if (target <= now) target = target.AddDays(1);
 
             var due = target - now;
+            BackupLogger.Log("Scheduler", $"Programado: próximo respaldo a las {target:yyyy-MM-dd HH:mm:ss} (en {due.TotalMinutes:F0} minutos)");
+
             _timer?.Dispose();
             _timer = new System.Threading.Timer(async _ =>
             {
-                try { await _onTick().ConfigureAwait(false); }
-                finally { ScheduleNext(); } 
+                try
+                {
+                    BackupLogger.Log("Scheduler", "Disparado: ejecutando respaldo programado...");
+                    await _onTick().ConfigureAwait(false);
+                    BackupLogger.Log("Scheduler", "Respaldo programado finalizado.");
+                }
+                catch (Exception ex)
+                {
+                    BackupLogger.LogException("Scheduler", "ejecución de _onTick", ex);
+                }
+                finally
+                {
+                    try { ScheduleNext(); }
+                    catch (Exception ex) { BackupLogger.LogException("Scheduler", "reprogramar", ex); }
+                }
             }, null, due, System.Threading.Timeout.InfiniteTimeSpan);
         }
 

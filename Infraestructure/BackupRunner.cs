@@ -32,16 +32,19 @@ namespace SACTIBACKUP.Infrastructure
             _specialDbsBackedUp.Clear();
             _diagnosticLog.Clear();
 
+            BackupLogger.Log("BackupRunner", "EvaluateAndRunAsync: inicio.");
             BackupProgressReporter.ReportInitializing("Iniciando proceso de respaldo...");
 
             var cfgObj = ConfigManager.Load();
             var cfg = BackupConfigMapper.FromJObject(cfgObj);
 
+            BackupLogger.Log("BackupRunner", $"Validando licencia para '{cfg.CorreoFTP}'...");
             BackupProgressReporter.Report(BackupStage.Initializing, $"Validando licencia para '{cfg.CorreoFTP}'...", 2);
             var lic = await LicenseService.ObtenerPorUsuarioAsync(cfg.CorreoFTP.ToUpperInvariant());
             if (lic is null)
             {
                 var errorMsg = LicenseService.LastError ?? "Error desconocido al validar licencia";
+                BackupLogger.Log("BackupRunner", $"ABORTA: licencia no obtenida. {errorMsg}");
                 BackupProgressReporter.ReportError(errorMsg);
                 EmailService.SendBackupResult(
                     error: true,
@@ -56,6 +59,7 @@ namespace SACTIBACKUP.Infrastructure
             }
             if (lic.LicenciaVencida)
             {
+                BackupLogger.Log("BackupRunner", $"ABORTA: licencia vencida (FechaFin={lic.FechaFin}).");
                 BackupProgressReporter.ReportError("Licencia vencida");
                 EmailService.SendBackupResult(
                     error: true,
@@ -69,20 +73,26 @@ namespace SACTIBACKUP.Infrastructure
                 return;
             }
 
-
             var hoy = DateTime.Today;
             var ultimoLocal = cfg.FechaUltimoRespaldo;
             var diff = ultimoLocal.HasValue ? (hoy - ultimoLocal.Value.Date).TotalDays : double.MaxValue;
 
+            BackupLogger.Log("BackupRunner",
+                $"Licencia OK. ultimoLocal={ultimoLocal:yyyy-MM-dd}, diff={diff:F1}, RespaldarCada={lic.RespaldarCada}.");
+
             if (diff < lic.RespaldarCada)
             {
+                BackupLogger.Log("BackupRunner", $"NO RESPALDA: diff ({diff:F1}) < RespaldarCada ({lic.RespaldarCada}). Próximo en {lic.RespaldarCada - (int)diff} día(s).");
                 BackupProgressReporter.Report(BackupStage.Completed,
                     $"No es necesario respaldar. Último respaldo: {ultimoLocal?.ToString("dd/MM/yyyy") ?? "Nunca"}. Próximo en {lic.RespaldarCada - (int)diff} día(s).", 100);
                 return;
             }
 
+            BackupLogger.Log("BackupRunner", "Iniciando respaldo real (ExecuteBackupAsync)...");
             BackupProgressReporter.Report(BackupStage.Initializing, "Iniciando respaldo de bases de datos...", 5);
             await ExecuteBackupAsync(cfg).ConfigureAwait(false);
+            BackupLogger.Log("BackupRunner",
+                $"ExecuteBackupAsync terminó. erroresSql={_erroresSql.Count}, erroresFb={_erroresFb.Count}, errorFtp={_errorFtp}.");
 
             if (cfg.RespaldarNube)
             {
@@ -163,6 +173,9 @@ namespace SACTIBACKUP.Infrastructure
                 correoReceptorCliente: lic?.CorreoNotificacion ?? cfg.CorreoNotificaciones ?? ""
             );
 
+            BackupLogger.Log("BackupRunner",
+                $"FIN: respaldo completado. Email enviado a '{lic?.CorreoNotificacion ?? cfg.CorreoNotificaciones}'. " +
+                $"erroresSql={_erroresSql.Count}, erroresFb={_erroresFb.Count}, errorFtp={_errorFtp}.");
             BackupProgressReporter.ReportCompleted();
         }
 

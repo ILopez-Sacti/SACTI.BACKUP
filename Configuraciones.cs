@@ -37,6 +37,7 @@ public partial class Configuraciones : Form
         chkUsarRazonSocial.Checked = true;
         chkComprimidas.Checked = true;
         chkIniciarConWindows.Checked = true;
+        chkIniciarConWindows.Enabled = false; // siempre activo, no editable
 
         gcInstanciasSQL.DataSource = _sqlList;
         gcBDDFireBird.DataSource = _fbList;
@@ -408,19 +409,12 @@ public partial class Configuraciones : Form
 
             ConfigManager.Save(jsonObj);
 
-            // Registrar/desregistrar tarea de inicio con Windows
-            if (chkIniciarConWindows.Checked)
+            // Iniciar con Windows siempre activo: garantizar que la tarea esté registrada.
+            if (!StartupTaskService.IsRegistered())
             {
                 var (ok, error) = StartupTaskService.Register();
                 if (!ok)
                     MessageBox.Show($"No se pudo registrar el inicio con Windows: {error}", "Aviso",
-                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
-            else
-            {
-                var (ok, error) = StartupTaskService.Unregister();
-                if (!ok)
-                    MessageBox.Show($"No se pudo desregistrar el inicio con Windows: {error}", "Aviso",
                         MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
 
@@ -572,8 +566,9 @@ public partial class Configuraciones : Form
         chkComprimidas.Checked = ((string?)obj["BDComprimidas"]) == "SI";
         chkUsarRazonSocial.Checked = ((string?)obj["UsarRazonSocial"]) == "SI";
 
-        var iniciarConWindows = (string?)obj["IniciarConWindows"];
-        chkIniciarConWindows.Checked = iniciarConWindows == null || iniciarConWindows == "SI";
+        // Iniciar con Windows siempre activo (no se permite desactivar).
+        chkIniciarConWindows.Checked = true;
+        chkIniciarConWindows.Enabled = false;
 
         // Cargar listas en grids
         _fbList.Clear();

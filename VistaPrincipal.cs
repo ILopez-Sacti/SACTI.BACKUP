@@ -18,9 +18,33 @@ namespace SACTIBACKUP
             ConfigurarPanelRespaldo();
             SuscribirseAProgreso();
             AsignarEventos();
+            AsegurarInicioConWindows();
             CargarYProgramarScheduler();
 
             ValidarRespaldo();
+        }
+
+        private static void AsegurarInicioConWindows()
+        {
+            try
+            {
+                if (StartupTaskService.IsRegistered())
+                {
+                    BackupLogger.Log("Startup", "Tarea de inicio con Windows ya está registrada.");
+                    return;
+                }
+
+                BackupLogger.Log("Startup", "Tarea de inicio con Windows no registrada. Intentando registrar...");
+                var (ok, error) = StartupTaskService.Register();
+                if (ok)
+                    BackupLogger.Log("Startup", "Tarea de inicio con Windows registrada exitosamente.");
+                else
+                    BackupLogger.Log("Startup", $"No se pudo registrar inicio con Windows: {error}");
+            }
+            catch (Exception ex)
+            {
+                BackupLogger.LogException("Startup", "AsegurarInicioConWindows", ex);
+            }
         }
 
         private void ConfigurarPanelRespaldo()
@@ -127,17 +151,30 @@ namespace SACTIBACKUP
 
         private async void ValidarRespaldo()
         {
+            BackupLogger.Log("ValidarRespaldo", "Inicio (arranque de la app).");
+
             var cfgObj = ConfigManager.Load();
             var cfg = BackupConfigMapper.FromJObject(cfgObj);
 
             if (cfg == null || string.IsNullOrWhiteSpace(cfg.CorreoFTP))
+            {
+                BackupLogger.Log("ValidarRespaldo", "Saliendo: configuración nula o CorreoFTP vacío.");
                 return;
+            }
 
             try
             {
                 LicenseResult? lic = await LicenseService.ObtenerPorUsuarioAsync(cfg.CorreoFTP.ToUpperInvariant());
-                if (lic == null || lic.LicenciaVencida)
+                if (lic == null)
+                {
+                    BackupLogger.Log("ValidarRespaldo", $"Saliendo: licencia no obtenida. LastError='{LicenseService.LastError}'");
                     return;
+                }
+                if (lic.LicenciaVencida)
+                {
+                    BackupLogger.Log("ValidarRespaldo", $"Saliendo: licencia vencida (FechaFin={lic.FechaFin}).");
+                    return;
+                }
 
                 var hoy = DateTime.Today;
 
@@ -157,21 +194,70 @@ namespace SACTIBACKUP
                 bool respaldoHoyLocal = ultimoRespaldoLocal.HasValue && ultimoRespaldoLocal.Value.Date == hoy;
                 bool respaldoHoyNube = ultimoRespaldoNube.HasValue && ultimoRespaldoNube.Value.Date == hoy;
 
+                var horaStr = (string?)cfgObj["HoraRespaldo"] ?? "00:00:00";
+                BackupLogger.Log("ValidarRespaldo",
+                    $"Estado: ultimoLocal={ultimoRespaldoLocal:yyyy-MM-dd}, ultimoNube={ultimoRespaldoNube:yyyy-MM-dd}, " +
+                    $"diasLocal={diasDesdeUltimoLocal:F1}, diasNube={diasDesdeUltimoNube:F1}, " +
+                    $"RespaldarCada={lic.RespaldarCada}, RespaldarNube={cfg.RespaldarNube}, HoraRespaldo={horaStr}");
+
                 // Si ya se hizo respaldo hoy, no hacer nada
                 if (respaldoHoyLocal && (respaldoHoyNube || !cfg.RespaldarNube))
+                {
+                    BackupLogger.Log("ValidarRespaldo", "Saliendo: respaldo ya realizado hoy.");
                     return;
+                }
 
                 // Verificar si han pasado los días configurados para respaldar
                 bool debeRespaldar = diasDesdeUltimoLocal >= lic.RespaldarCada || diasDesdeUltimoNube >= lic.RespaldarCada;
-
-                if (debeRespaldar)
+                if (!debeRespaldar)
                 {
-                    await EjecutarRespaldoConIndicador();
+                    BackupLogger.Log("ValidarRespaldo", $"Saliendo: aún no toca respaldar (faltan días según RespaldarCada={lic.RespaldarCada}).");
+                    return;
                 }
+
+                // Si la hora programada aún no pasa hoy Y el respaldo está al día (no atrasado más
+                // allá de RespaldarCada), dejar que el scheduler lo haga a la hora.
+                // Si ya pasó la hora, o si lleva días atrasado (la app se cerró y se perdieron disparos
+                // del scheduler), hacer catch-up inmediato — no se puede confiar en que la app siga
+                // abierta hasta la siguiente hora programada.
+                bool yaPasoHora = YaPasoHoraProgramadaHoy(horaStr);
+                bool atrasado = diasDesdeUltimoLocal > lic.RespaldarCada || diasDesdeUltimoNube > lic.RespaldarCada;
+                if (!yaPasoHora && !atrasado)
+                {
+                    BackupLogger.Log("ValidarRespaldo", "Delegando al Scheduler: respaldo al día y la hora aún no pasa hoy.");
+                    return;
+                }
+
+                BackupLogger.Log("ValidarRespaldo",
+                    $"Catch-up inmediato: yaPasoHora={yaPasoHora}, atrasado={atrasado}. Ejecutando respaldo ahora.");
+                await EjecutarRespaldoConIndicador();
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"Error en ValidarRespaldo: {ex.Message}");
+                BackupLogger.LogException("ValidarRespaldo", "flujo principal", ex);
+            }
+        }
+
+        /// <summary>
+        /// Retorna true si la hora programada de hoy ya pasó.
+        /// Si ya pasó, ValidarRespaldo puede ejecutar como "catch-up" de respaldo perdido.
+        /// Si aún no pasa, se deja al scheduler que lo haga a su hora.
+        /// </summary>
+        private static bool YaPasoHoraProgramadaHoy(string horaRespaldo)
+        {
+            try
+            {
+                var parts = horaRespaldo.Split(':');
+                var h = int.Parse(parts[0]);
+                var m = int.Parse(parts.Length > 1 ? parts[1] : "0");
+                var sec = int.Parse(parts.Length > 2 ? parts[2] : "0");
+                var now = DateTime.Now;
+                var targetHoy = new DateTime(now.Year, now.Month, now.Day, h, m, sec);
+                return now > targetHoy;
+            }
+            catch
+            {
+                return true; // en caso de error, permitir el respaldo
             }
         }
 
@@ -182,19 +268,25 @@ namespace SACTIBACKUP
 
         private async Task EjecutarRespaldoConIndicador()
         {
-            if (_respaldoEnProgreso) return;
+            if (_respaldoEnProgreso)
+            {
+                BackupLogger.Log("EjecutarRespaldo", "Saliendo: ya hay un respaldo en progreso.");
+                return;
+            }
 
             try
             {
+                BackupLogger.Log("EjecutarRespaldo", "Iniciando respaldo (mostrando indicador).");
                 MostrarRespaldoEnProgreso(true);
                 await BackupRunner.EvaluateAndRunAsync().ConfigureAwait(false);
+                BackupLogger.Log("EjecutarRespaldo", "BackupRunner.EvaluateAndRunAsync regresó sin excepción.");
 
                 // Esperar un momento para que el usuario vea el resultado
                 await Task.Delay(2000).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"Error en EjecutarRespaldoConIndicador: {ex}");
+                BackupLogger.LogException("EjecutarRespaldo", "BackupRunner.EvaluateAndRunAsync", ex);
                 BackupProgressReporter.ReportError($"Error: {ex.Message}");
                 await Task.Delay(3000).ConfigureAwait(false); // Mostrar error más tiempo
             }
@@ -234,8 +326,13 @@ namespace SACTIBACKUP
 
             if (vistaConfig.acepto || vistaConfig.RealizarRespaldo)
             {
+                BackupLogger.Log("Configuracion", "Usuario guardó configuración: reprogramando scheduler y ejecutando respaldo manual.");
                 CargarYProgramarScheduler();
                 await EjecutarRespaldoConIndicador();
+            }
+            else
+            {
+                BackupLogger.Log("Configuracion", "Usuario cerró configuración sin guardar.");
             }
         }
 
