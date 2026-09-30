@@ -19,6 +19,7 @@ namespace SACTIBACKUP.Infrastructure
     {
         private static readonly List<string> _erroresSql = new();
         private static readonly List<string> _erroresFb = new();
+        private static readonly List<string> _erroresRotacion = new();
         private static bool _errorFtp;
         private static readonly HashSet<string> _specialDbsBackedUp = new(StringComparer.OrdinalIgnoreCase);
         private static readonly List<string> _diagnosticLog = new();
@@ -28,6 +29,7 @@ namespace SACTIBACKUP.Infrastructure
         {
             _erroresSql.Clear();
             _erroresFb.Clear();
+            _erroresRotacion.Clear();
             _errorFtp = false;
             _specialDbsBackedUp.Clear();
             _diagnosticLog.Clear();
@@ -46,7 +48,7 @@ namespace SACTIBACKUP.Infrastructure
                 var errorMsg = LicenseService.LastError ?? "Error desconocido al validar licencia";
                 BackupLogger.Log("BackupRunner", $"ABORTA: licencia no obtenida. {errorMsg}");
                 BackupProgressReporter.ReportError(errorMsg);
-                EmailService.SendBackupResult(
+                var envioLic = EmailService.SendBackupResult(
                     error: true,
                     mensaje: $"No se pudo validar licencia: {errorMsg}",
                     nota: "Ponerse en contacto con su proveedor de servicio de respaldo.",
@@ -55,21 +57,23 @@ namespace SACTIBACKUP.Infrastructure
                     passwordElEmisor: "K0fxKheC{hV*",
                     correoReceptorCliente: cfg.CorreoNotificaciones ?? ""
                 );
+                BackupLogger.Log("BackupRunner", $"Notificación de error de licencia: {envioLic.Resumen()}");
                 return;
             }
             if (lic.LicenciaVencida)
             {
                 BackupLogger.Log("BackupRunner", $"ABORTA: licencia vencida (FechaFin={lic.FechaFin}).");
                 BackupProgressReporter.ReportError("Licencia vencida");
-                EmailService.SendBackupResult(
+                var envioVencida = EmailService.SendBackupResult(
                     error: true,
                     mensaje: "No se puede realizar el respaldo de su información debido a que su licencia ha caducado.",
                     nota: "En caso de renovación ponerse en contacto con su proveedor de servicio de respaldo.",
                     nombreEmpresa: cfg.CorreoFTP.Equals("GENERALSAC", StringComparison.OrdinalIgnoreCase) ? "General SACTI" : (cfg.AliasGlobal ?? "SACTI"),
                     correoEmisor: "backup@sacti.mx",
                     passwordElEmisor: "K0fxKheC{hV*",
-                    correoReceptorCliente: lic.CorreoNotificacion
+                    correoReceptorCliente: EmailService.CombinarListas(lic.CorreoNotificacion, cfg.CorreoNotificaciones)
                 );
+                BackupLogger.Log("BackupRunner", $"Notificación de licencia vencida: {envioVencida.Resumen()}");
                 return;
             }
 
@@ -96,24 +100,47 @@ namespace SACTIBACKUP.Infrastructure
 
             if (cfg.RespaldarNube)
             {
-                BackupProgressReporter.ReportRotation();
-                await FtpRotationService.ApplyPoliciesAsync(
-                    host: "sacti.ddns.net",
-                    usuario: cfg.CorreoFTP,
-                    password: cfg.PasswordFTP,
-                    mantenerMinimo: lic.MantenerMinimo,
-                    borrarCadaDias: lic.BorrarCada
-                ).ConfigureAwait(false);
+                // La rotación es housekeeping: si falla NO debe impedir que se avise al cliente.
+                // Antes iba sin try/catch y cualquier error de FTP abortaba el método completo,
+                // dejando el respaldo hecho pero sin correo de notificación.
+                try
+                {
+                    BackupProgressReporter.ReportRotation();
+                    var rot = await FtpRotationService.ApplyPoliciesAsync(
+                        host: "sacti.ddns.net",
+                        usuario: cfg.CorreoFTP,
+                        password: cfg.PasswordFTP,
+                        mantenerMinimo: lic.MantenerMinimo,
+                        borrarCadaDias: lic.BorrarCada
+                    ).ConfigureAwait(false);
+
+                    BackupLogger.Log("BackupRunner", $"Rotación FTP: {rot.Resumen()}");
+                    if (rot.Errores.Count > 0)
+                        _erroresRotacion.AddRange(rot.Errores);
+                }
+                catch (Exception ex)
+                {
+                    BackupLogger.LogException("BackupRunner", "FtpRotationService.ApplyPoliciesAsync", ex);
+                    _erroresRotacion.Add($"Rotación FTP: {ex.GetType().Name}: {ex.Message}");
+                }
             }
 
        
-            var nowDate = DateTime.Now.Date;
-            cfgObj["FechaUltimoRespaldo"] = nowDate;
-            if (cfg.RespaldarNube) cfgObj["FechaUltimoRespaldoNube"] = nowDate;
-            ConfigManager.Save(cfgObj);
+            // Nada de lo que sigue debe impedir el correo de notificación.
+            try
+            {
+                var nowDate = DateTime.Now.Date;
+                cfgObj["FechaUltimoRespaldo"] = nowDate;
+                if (cfg.RespaldarNube) cfgObj["FechaUltimoRespaldoNube"] = nowDate;
+                ConfigManager.Save(cfgObj);
 
-            await LicenseUpdates.UpdateLastBackupDatesAsync(cfg.CorreoFTP.ToUpperInvariant(), nowDate, cfg.RespaldarNube ? nowDate : (DateTime?)null)
-                .ConfigureAwait(false);
+                await LicenseUpdates.UpdateLastBackupDatesAsync(cfg.CorreoFTP.ToUpperInvariant(), nowDate, cfg.RespaldarNube ? nowDate : (DateTime?)null)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                BackupLogger.LogException("BackupRunner", "guardado de fechas de último respaldo", ex);
+            }
 
          
             var nombreEmpresa = cfg.CorreoFTP.Equals("GENERALSAC", StringComparison.OrdinalIgnoreCase)
@@ -163,19 +190,30 @@ namespace SACTIBACKUP.Infrastructure
                 notaCorreo = "Es importante que le haga llegar este correo a su proveedor de servicio de respaldo.";
             }
 
-            EmailService.SendBackupResult(
+            // Se notifica tanto al correo registrado en la licencia como a los capturados
+            // en la configuración local (pueden ser varios, separados por ',' o ';').
+            var destinatarios = EmailService.CombinarListas(lic?.CorreoNotificacion, cfg.CorreoNotificaciones);
+
+            var envio = EmailService.SendBackupResult(
                 error: (huboErrorSql || huboErrorFirebird || _errorFtp),
                 mensaje: mensajeCorreo,
                 nota: notaCorreo,
                 nombreEmpresa: nombreEmpresa,
                 correoEmisor: "backup@sacti.mx",
                 passwordElEmisor: "K0fxKheC{hV*",
-                correoReceptorCliente: lic?.CorreoNotificacion ?? cfg.CorreoNotificaciones ?? ""
+                correoReceptorCliente: destinatarios
             );
 
             BackupLogger.Log("BackupRunner",
-                $"FIN: respaldo completado. Email enviado a '{lic?.CorreoNotificacion ?? cfg.CorreoNotificaciones}'. " +
-                $"erroresSql={_erroresSql.Count}, erroresFb={_erroresFb.Count}, errorFtp={_errorFtp}.");
+                $"FIN: respaldo completado. {envio.Resumen()} " +
+                $"(licencia='{lic?.CorreoNotificacion}', config='{cfg.CorreoNotificaciones}'). " +
+                $"erroresSql={_erroresSql.Count}, erroresFb={_erroresFb.Count}, errorFtp={_errorFtp}, " +
+                $"erroresRotacion={_erroresRotacion.Count}.");
+
+            if (_erroresRotacion.Count > 0)
+                BackupLogger.Log("BackupRunner",
+                    $"ATENCION (interno SACTI): la rotación FTP reportó {_erroresRotacion.Count} error(es). " +
+                    $"Los respaldos viejos NO se están depurando: {string.Join(" | ", _erroresRotacion.Take(5))}");
             BackupProgressReporter.ReportCompleted();
         }
 

@@ -370,8 +370,11 @@
             txtCorreoNotificaciones.Properties.Appearance.Options.UseBorderColor = true;
             txtCorreoNotificaciones.Properties.Appearance.Options.UseFont = true;
             txtCorreoNotificaciones.Properties.BorderStyle = DevExpress.XtraEditors.Controls.BorderStyles.Simple;
+            txtCorreoNotificaciones.Properties.NullValuePrompt = "correo1@empresa.com; correo2@empresa.com";
+            txtCorreoNotificaciones.Properties.NullValuePromptShowForEmptyValue = true;
             txtCorreoNotificaciones.Size = new Size(402, 26);
             txtCorreoNotificaciones.TabIndex = 16;
+            txtCorreoNotificaciones.ToolTip = "Puede capturar uno o varios correos separados por ',' o ';'";
             // 
             // labelControl7
             // 
@@ -381,7 +384,7 @@
             labelControl7.Name = "labelControl7";
             labelControl7.Size = new Size(151, 20);
             labelControl7.TabIndex = 15;
-            labelControl7.Text = "Correo Notificaciones";
+            labelControl7.Text = "Correo Notificaciones (separe varios con , o ;)";
             // 
             // txtAliasGlobal
             // 

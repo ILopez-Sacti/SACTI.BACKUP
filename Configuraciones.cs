@@ -251,6 +251,29 @@ public partial class Configuraciones : Form
             return;
         }
 
+        // Correos de notificación: se aceptan varios separados por ',' o ';'
+        var (correosValidos, correosInvalidos) = EmailService.ParseDestinatarios(correoNotificaciones);
+        if (correosInvalidos.Count > 0)
+        {
+            MessageBox.Show(
+                "Los siguientes correos no tienen un formato válido:\n\n" +
+                string.Join("\n", correosInvalidos) +
+                "\n\nSepare varios correos con ',' o ';'  (ejemplo: juan@empresa.com; ana@empresa.com)",
+                "Correo de notificaciones", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            txtCorreoNotificaciones.Focus();
+            return;
+        }
+        if (correosValidos.Count == 0)
+        {
+            MessageBox.Show("Debe capturar al menos un correo de notificaciones válido.",
+                "Correo de notificaciones", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            txtCorreoNotificaciones.Focus();
+            return;
+        }
+        // Se guarda normalizado: "a@x.com; b@x.com"
+        correoNotificaciones = EmailService.NormalizarLista(correosValidos);
+        txtCorreoNotificaciones.Text = correoNotificaciones;
+
         // Validar formato de hora (ya normalizado a HH:mm:ss)
         if (!Regex.IsMatch(horaRespaldo, @"^\d{2}:\d{2}:\d{2}$"))
         {
@@ -367,9 +390,9 @@ public partial class Configuraciones : Form
             MostrarConectando("Guardando configuración...");
 
             dynamic jsonObj;
-            if (File.Exists("SactiBackup.json"))
+            if (File.Exists(ConfigManager.FullPath))
             {
-                string jsonBase64 = File.ReadAllText("SactiBackup.json");
+                string jsonBase64 = File.ReadAllText(ConfigManager.FullPath);
                 string jsonPlano = Encoding.UTF8.GetString(Convert.FromBase64String(jsonBase64));
                 jsonObj = JObject.Parse(jsonPlano);
             }
