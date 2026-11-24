@@ -24,6 +24,7 @@ public partial class Configuraciones : Form
     public Configuraciones()
     {
         InitializeComponent();
+        try { Icon = System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!); } catch { }
 
         _model = BackupSettingsRepository.Load();
 

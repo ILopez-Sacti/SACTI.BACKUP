@@ -15,6 +15,7 @@ namespace SACTIBACKUP
         public VistaPrincipal()
         {
             InitializeComponent();
+            AplicarIconoApp();
             ConfigurarPanelRespaldo();
             SuscribirseAProgreso();
             AsignarEventos();
@@ -22,6 +23,21 @@ namespace SACTIBACKUP
             CargarYProgramarScheduler();
 
             ValidarRespaldo();
+        }
+
+        // Icono de marca en la ventana, la barra de tareas y el icono de la bandeja.
+        private void AplicarIconoApp()
+        {
+            try
+            {
+                var ico = System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!);
+                if (ico != null)
+                {
+                    Icon = ico;
+                    if (notifyIcon1 != null) notifyIcon1.Icon = ico;
+                }
+            }
+            catch { /* si falla, se queda el icono por defecto */ }
         }
 
         private static void AsegurarInicioConWindows()

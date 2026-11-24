@@ -19,6 +19,7 @@ namespace SACTIBACKUP
         public PwdConfirm(string _pwd)
         {
             InitializeComponent();
+            try { Icon = System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!); } catch { }
             pwd = _pwd;
 
 
