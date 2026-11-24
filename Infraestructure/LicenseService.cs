@@ -39,8 +39,8 @@ namespace SACTIBACKUP.Infrastructure
             {
                 DataSource = @"sacti.ddns.net\sacti,2014",
                 InitialCatalog = "SACTIBACKUP",
-                UserID = "sa",
-                Password = "MasterkeySac123",
+                UserID = "sactibackup_cli",
+                Password = "hsGgqWwO1ggK3XKe8QqQs1vy",
                 Encrypt = false,
                 TrustServerCertificate = true,
                 ConnectTimeout = 10
