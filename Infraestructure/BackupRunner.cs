@@ -24,6 +24,12 @@ namespace SACTIBACKUP.Infrastructure
         private static readonly HashSet<string> _specialDbsBackedUp = new(StringComparer.OrdinalIgnoreCase);
         private static readonly List<string> _diagnosticLog = new();
 
+        // Resultado real de la corrida: cuantos .rar se generaron y cuales quedaron verificados en el FTP.
+        // Una corrida con 0 archivos NO es un respaldo exitoso.
+        private static int _archivosGenerados;
+        private static readonly List<string> _archivosSubidos = new();
+        private static readonly List<string> _erroresSubida = new();
+
 
         public static async Task EvaluateAndRunAsync()
         {
@@ -31,6 +37,9 @@ namespace SACTIBACKUP.Infrastructure
             _erroresFb.Clear();
             _erroresRotacion.Clear();
             _errorFtp = false;
+            _archivosGenerados = 0;
+            _archivosSubidos.Clear();
+            _erroresSubida.Clear();
             _specialDbsBackedUp.Clear();
             _diagnosticLog.Clear();
 
@@ -95,14 +104,24 @@ namespace SACTIBACKUP.Infrastructure
             BackupLogger.Log("BackupRunner", "Iniciando respaldo real (ExecuteBackupAsync)...");
             BackupProgressReporter.Report(BackupStage.Initializing, "Iniciando respaldo de bases de datos...", 5);
             await ExecuteBackupAsync(cfg).ConfigureAwait(false);
-            BackupLogger.Log("BackupRunner",
-                $"ExecuteBackupAsync terminó. erroresSql={_erroresSql.Count}, erroresFb={_erroresFb.Count}, errorFtp={_errorFtp}.");
+            bool sinArchivos = _archivosGenerados == 0;
+            bool nubeOk = cfg.RespaldarNube && !_errorFtp && _archivosSubidos.Count > 0;
 
-            if (cfg.RespaldarNube)
+            BackupLogger.Log("BackupRunner",
+                $"ExecuteBackupAsync terminó. archivosGenerados={_archivosGenerados}, archivosSubidos={_archivosSubidos.Count}, " +
+                $"erroresSql={_erroresSql.Count}, erroresFb={_erroresFb.Count}, errorFtp={_errorFtp}.");
+
+            // La rotación SOLO corre si en esta corrida se subió y verificó al menos un respaldo nuevo
+            // y no hubo errores de FTP. Antes corría siempre: si la corrida no generaba nada (o la subida
+            // fallaba en silencio), borraba los respaldos anteriores y dejaba la nube del cliente vacía.
+            if (cfg.RespaldarNube && !nubeOk)
+            {
+                BackupLogger.Log("BackupRunner",
+                    "Rotación FTP OMITIDA: no hay respaldo nuevo verificado en la nube; se conservan los anteriores.");
+            }
+            else if (nubeOk)
             {
                 // La rotación es housekeeping: si falla NO debe impedir que se avise al cliente.
-                // Antes iba sin try/catch y cualquier error de FTP abortaba el método completo,
-                // dejando el respaldo hecho pero sin correo de notificación.
                 try
                 {
                     BackupProgressReporter.ReportRotation();
@@ -111,7 +130,8 @@ namespace SACTIBACKUP.Infrastructure
                         usuario: cfg.CorreoFTP,
                         password: cfg.PasswordFTP,
                         mantenerMinimo: lic.MantenerMinimo,
-                        borrarCadaDias: lic.BorrarCada
+                        borrarCadaDias: lic.BorrarCada,
+                        archivosProtegidos: _archivosSubidos
                     ).ConfigureAwait(false);
 
                     BackupLogger.Log("BackupRunner", $"Rotación FTP: {rot.Resumen()}");
@@ -127,15 +147,25 @@ namespace SACTIBACKUP.Infrastructure
 
        
             // Nada de lo que sigue debe impedir el correo de notificación.
+            // Si no se generó nada NO se marca como respaldado: así el siguiente ciclo vuelve a intentar
+            // en lugar de esperar RespaldarCada días. La fecha de nube solo avanza con subida verificada.
             try
             {
-                var nowDate = DateTime.Now.Date;
-                cfgObj["FechaUltimoRespaldo"] = nowDate;
-                if (cfg.RespaldarNube) cfgObj["FechaUltimoRespaldoNube"] = nowDate;
-                ConfigManager.Save(cfgObj);
+                if (!sinArchivos)
+                {
+                    var nowDate = DateTime.Now.Date;
+                    var obj = ConfigManager.Load();
+                    obj["FechaUltimoRespaldo"] = nowDate;
+                    if (nubeOk) obj["FechaUltimoRespaldoNube"] = nowDate;
+                    ConfigManager.Save(obj);
 
-                await LicenseUpdates.UpdateLastBackupDatesAsync(cfg.CorreoFTP.ToUpperInvariant(), nowDate, cfg.RespaldarNube ? nowDate : (DateTime?)null)
-                    .ConfigureAwait(false);
+                    await LicenseUpdates.UpdateLastBackupDatesAsync(cfg.CorreoFTP.ToUpperInvariant(), nowDate, nubeOk ? nowDate : (DateTime?)null)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    BackupLogger.Log("BackupRunner", "No se actualizan fechas de último respaldo: la corrida no generó archivos.");
+                }
             }
             catch (Exception ex)
             {
@@ -186,7 +216,17 @@ namespace SACTIBACKUP.Infrastructure
 
             if (_errorFtp)
             {
-                mensajeCorreo = "Se realizó el respaldo de su información correctamente. Pero hubo un error al subir sus respaldos a la nube";
+                mensajeCorreo = "Se realizó el respaldo local de su información, pero hubo un error al subir sus respaldos a la nube.";
+                if (_erroresSubida.Count > 0)
+                    mensajeCorreo += "<br/><br/>" + string.Join("<br/>", _erroresSubida.Take(10));
+                notaCorreo = "Es importante que le haga llegar este correo a su proveedor de servicio de respaldo.";
+            }
+
+            if (sinArchivos)
+            {
+                // Tiene prioridad sobre cualquier otro mensaje: nunca reportar éxito sin archivos.
+                mensajeCorreo = "NO se generó ningún archivo de respaldo. Verifique la configuración de SACTI-BACKUP " +
+                                "(instancias SQL / bases Firebird) y que el servidor de base de datos esté disponible.";
                 notaCorreo = "Es importante que le haga llegar este correo a su proveedor de servicio de respaldo.";
             }
 
@@ -195,7 +235,7 @@ namespace SACTIBACKUP.Infrastructure
             var destinatarios = EmailService.CombinarListas(lic?.CorreoNotificacion, cfg.CorreoNotificaciones);
 
             var envio = EmailService.SendBackupResult(
-                error: (huboErrorSql || huboErrorFirebird || _errorFtp),
+                error: (huboErrorSql || huboErrorFirebird || _errorFtp || sinArchivos),
                 mensaje: mensajeCorreo,
                 nota: notaCorreo,
                 nombreEmpresa: nombreEmpresa,
@@ -207,8 +247,9 @@ namespace SACTIBACKUP.Infrastructure
             BackupLogger.Log("BackupRunner",
                 $"FIN: respaldo completado. {envio.Resumen()} " +
                 $"(licencia='{lic?.CorreoNotificacion}', config='{cfg.CorreoNotificaciones}'). " +
+                $"archivosGenerados={_archivosGenerados}, archivosSubidos={_archivosSubidos.Count}, " +
                 $"erroresSql={_erroresSql.Count}, erroresFb={_erroresFb.Count}, errorFtp={_errorFtp}, " +
-                $"erroresRotacion={_erroresRotacion.Count}.");
+                $"erroresSubida={_erroresSubida.Count}, erroresRotacion={_erroresRotacion.Count}.");
 
             if (_erroresRotacion.Count > 0)
                 BackupLogger.Log("BackupRunner",
@@ -265,8 +306,16 @@ namespace SACTIBACKUP.Infrastructure
                     }
                 }
 
-                // Subida a FTP
-                if (cfg.RespaldarNube)
+                _archivosGenerados = Directory.Exists(pathBase)
+                    ? Directory.EnumerateFiles(pathBase, "*.rar", SearchOption.TopDirectoryOnly).Count()
+                    : 0;
+                BackupLogger.Log("BackupRunner",
+                    $"Archivos .rar generados en '{pathBase}': {_archivosGenerados} " +
+                    $"(RespaldarSQL={cfg.RespaldarSQL}, instancias={cfg.ListaInstanciasSQL.Count}, " +
+                    $"RespaldarFireBird={cfg.RespaldarFireBird}, rutasFb={cfg.ListaRutaFireBird.Count}).");
+
+                // Subida a FTP (sin archivos no hay nada que subir: se reporta como error en el correo)
+                if (cfg.RespaldarNube && _archivosGenerados > 0)
                 {
                     try
                     {
@@ -281,27 +330,14 @@ namespace SACTIBACKUP.Infrastructure
                     catch (Exception ex)
                     {
                         _errorFtp = true;
+                        _erroresSubida.Add($"Error FTP: {ex.Message}");
+                        BackupLogger.LogException("BackupRunner", "UploadRarsToFtpAsync", ex);
                         BackupProgressReporter.ReportError($"Error FTP: {ex.Message}");
-                        System.Diagnostics.Debug.WriteLine($"Error FTP: {ex}");
                     }
                 }
 
-                // Guardar fechas localmente
-                var obj = ConfigManager.Load();
-                var fLocal = new DateTime(today.Year, today.Month, today.Day);
-                obj["FechaUltimoRespaldo"] = fLocal;
-                if (cfg.RespaldarNube && !_errorFtp) obj["FechaUltimoRespaldoNube"] = fLocal;
-                ConfigManager.Save(obj);
-
-                try
-                {
-                    await LicenseUpdates.UpdateLastBackupDatesAsync(cfg.CorreoFTP.ToUpperInvariant(), fLocal, (cfg.RespaldarNube && !_errorFtp) ? fLocal : (DateTime?)null)
-                        .ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    System.Diagnostics.Debug.WriteLine($"Error actualizando fechas remotas: {ex}");
-                }
+                // Las fechas de último respaldo se guardan UNA sola vez en EvaluateAndRunAsync,
+                // y solo si la corrida generó archivos (y la de nube solo con subida verificada).
             }).ConfigureAwait(false);
         }
 
@@ -722,12 +758,15 @@ namespace SACTIBACKUP.Infrastructure
                 var rarFiles = Directory.EnumerateFiles(pathBase, "*.rar", SearchOption.TopDirectoryOnly).ToList();
                 int totalFiles = rarFiles.Count;
 
-                // Si no hay archivos para subir
+                // Sin archivos no hay respaldo: el llamador ya lo evita, pero nunca se reporta como éxito.
                 if (totalFiles == 0)
                 {
+                    BackupLogger.Log("BackupRunner", $"Subida FTP: no hay archivos .rar en '{pathBase}'.");
                     BackupProgressReporter.Report(BackupStage.UploadingToFTP, "No hay archivos para subir a la nube", 95);
-                    return true; // No es un error, simplemente no hay nada que subir
+                    return false;
                 }
+
+                bool todoOk = true;
 
                 int currentFileIndex = 0;
 
@@ -785,30 +824,57 @@ namespace SACTIBACKUP.Infrastructure
                     }
                     catch (Exception exFile)
                     {
+                        // Continuar con el siguiente archivo, pero la subida YA NO es exitosa.
+                        todoOk = false;
+                        _erroresSubida.Add($"{nombre}: {exFile.Message}");
+                        BackupLogger.LogException("BackupRunner", $"subida FTP de '{nombre}'", exFile);
                         BackupProgressReporter.ReportError($"Error subiendo {nombre}: {exFile.Message}");
-                        System.Diagnostics.Debug.WriteLine($"Error subiendo {nombre}: {exFile}");
-                        // Continuar con el siguiente archivo
                     }
                 }
 
-                // Verificar y limpiar archivos subidos
+                // Verificar (existe en el FTP con el mismo tamaño) y solo entonces borrar la copia local.
                 BackupProgressReporter.Report(BackupStage.UploadingToFTP, "Verificando archivos subidos...", 94);
                 foreach (var archivo in rarFiles)
                 {
+                    var nombre = Path.GetFileName(archivo);
                     try
                     {
-                        var nombre = Path.GetFileName(archivo);
                         var url = $"ftp://sacti.ddns.net//{cfg.CorreoFTP.ToUpperInvariant()}//{nombre}";
 
-                        var reqDate = (FtpWebRequest)WebRequest.Create(url);
-                        reqDate.Credentials = new NetworkCredential(cfg.CorreoFTP, cfg.PasswordFTP);
-                        reqDate.Method = WebRequestMethods.Ftp.GetDateTimestamp;
+                        var reqSize = (FtpWebRequest)WebRequest.Create(url);
+                        reqSize.Credentials = new NetworkCredential(cfg.CorreoFTP, cfg.PasswordFTP);
+                        reqSize.Method = WebRequestMethods.Ftp.GetFileSize;
+                        reqSize.UseBinary = true;
+                        reqSize.KeepAlive = false;
 
-                        using var resp = (FtpWebResponse)await reqDate.GetResponseAsync().ConfigureAwait(false);
-                        if (resp.LastModified != default) SafeDelete(archivo);
+                        long remoto;
+                        using (var resp = (FtpWebResponse)await reqSize.GetResponseAsync().ConfigureAwait(false))
+                            remoto = resp.ContentLength;
+
+                        var local = new FileInfo(archivo).Length;
+                        if (remoto == local)
+                        {
+                            _archivosSubidos.Add(nombre);
+                            SafeDelete(archivo);
+                        }
+                        else
+                        {
+                            todoOk = false;
+                            _erroresSubida.Add($"{nombre}: tamaño en la nube ({remoto}) distinto al local ({local}); se conserva la copia local.");
+                            BackupLogger.Log("BackupRunner", $"Verificación FTP FALLÓ '{nombre}': remoto={remoto}, local={local}.");
+                        }
                     }
-                    catch { /* conserva local si no se puede verificar */ }
+                    catch (Exception exVer)
+                    {
+                        // Conserva local si no se puede verificar
+                        todoOk = false;
+                        _erroresSubida.Add($"{nombre}: no se pudo verificar en la nube ({exVer.Message}).");
+                        BackupLogger.LogException("BackupRunner", $"verificación FTP de '{nombre}'", exVer);
+                    }
                 }
+
+                BackupLogger.Log("BackupRunner",
+                    $"Subida FTP: {_archivosSubidos.Count}/{totalFiles} archivo(s) verificados. Errores={_erroresSubida.Count}.");
 
                 // Si no quedan .rar, borrar carpeta del día
                 var quedanRars = Directory.EnumerateFiles(pathBase, "*.rar").Any();
@@ -819,12 +885,13 @@ namespace SACTIBACKUP.Infrastructure
                     try { Directory.Delete(pathBase); } catch { /* ignore */ }
                 }
 
-                return true;
+                return todoOk;
             }
             catch (Exception ex)
             {
+                _erroresSubida.Add($"Error en subida FTP: {ex.Message}");
+                BackupLogger.LogException("BackupRunner", "UploadRarsToFtpAsync", ex);
                 BackupProgressReporter.ReportError($"Error en subida FTP: {ex.Message}");
-                System.Diagnostics.Debug.WriteLine($"Error en UploadRarsToFtpAsync: {ex}");
                 return false;
             }
         }

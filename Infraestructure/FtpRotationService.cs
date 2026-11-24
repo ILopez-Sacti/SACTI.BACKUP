@@ -35,10 +35,19 @@ namespace SACTIBACKUP.Infrastructure
         /// Aplica las políticas de retención en el FTP. Es housekeeping: nunca lanza excepción,
         /// los problemas se acumulan en el resultado para que el llamador los registre.
         /// </summary>
+        /// <param name="archivosProtegidos">
+        /// Archivos subidos y verificados en esta corrida: nunca se borran, sin importar politica.
+        /// </param>
         public static async Task<FtpRotationResult> ApplyPoliciesAsync(
-            string host, string usuario, string password, int mantenerMinimo, int borrarCadaDias)
+            string host, string usuario, string password, int mantenerMinimo, int borrarCadaDias,
+            IEnumerable<string>? archivosProtegidos = null)
         {
             var result = new FtpRotationResult();
+            var protegidos = new HashSet<string>(archivosProtegidos ?? Enumerable.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+
+            // Siempre se conserva al menos el respaldo mas reciente de cada BD, aunque la
+            // licencia traiga MantenerMinimo en 0: la rotacion jamas debe dejar la nube vacia.
+            var minimoGarantizado = Math.Max(1, mantenerMinimo);
             var baseUri = $"ftp://{host}";
 
             List<string> files;
@@ -64,13 +73,20 @@ namespace SACTIBACKUP.Infrastructure
             // tiraba una WebException que abortaba todo el respaldo.
             var borrados = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+            // Los N mas recientes de cada grupo (misma BD, distinta fecha) quedan protegidos
+            // para AMBAS politicas. Antes la politica por antiguedad los ignoraba y, si la
+            // corrida no subia nada nuevo, borraba todo y dejaba la nube vacia.
+            var groups = files
+                .GroupBy(BaseName, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.OrderByDescending(f => f, StringComparer.OrdinalIgnoreCase).ToList());
+
+            foreach (var list in groups.Values)
+                foreach (var file in list.Take(minimoGarantizado))
+                    protegidos.Add(file);
+
             // --- Politica 1: conservar solo los N mas recientes de cada grupo ---
             if (mantenerMinimo > 0)
             {
-                var groups = files
-                    .GroupBy(BaseName)
-                    .ToDictionary(g => g.Key, g => g.OrderByDescending(f => f, StringComparer.OrdinalIgnoreCase).ToList());
-
                 foreach (var kv in groups)
                 {
                     var list = kv.Value;
@@ -78,6 +94,7 @@ namespace SACTIBACKUP.Infrastructure
 
                     foreach (var file in list.Skip(mantenerMinimo))
                     {
+                        if (protegidos.Contains(file)) continue;
                         if (await TryDeleteAsync($"{baseUri}/{file}", usuario, password, file, result).ConfigureAwait(false))
                         {
                             borrados.Add(file);
@@ -95,6 +112,7 @@ namespace SACTIBACKUP.Infrastructure
                 foreach (var file in files)
                 {
                     if (borrados.Contains(file)) continue;   // ya no existe
+                    if (protegidos.Contains(file)) continue; // mas reciente de su BD o subido en esta corrida
 
                     DateTime? lastMod;
                     try
