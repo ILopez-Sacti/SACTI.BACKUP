@@ -118,7 +118,10 @@ namespace SACTIBACKUP.Infrastructure
             string passwordElEmisor,
             string correoReceptorCliente,
             string correoReceptorSacti = "backup@sacti.mx",
-            string plantillaHtmlPath = "PlantillaCorreoSactiBackUp.html"
+            string plantillaHtmlPath = "PlantillaCorreoSactiBackUp.html",
+            string smtpHost = "mail.sacti.mx",
+            int smtpPuerto = 587,
+            bool smtpEnableSsl = true
         )
         {
             var (destinatarios, invalidos) = ParseDestinatarios(correoReceptorCliente);
@@ -148,11 +151,11 @@ namespace SACTIBACKUP.Infrastructure
             {
                 var cuerpoCorreo = BuildHtmlFromTemplate(plantillaHtmlPath, mensaje, nota, nombreEmpresa);
 
-                using var client = new SmtpClient("mail.sacti.mx", 587)
+                using var client = new SmtpClient(smtpHost, smtpPuerto)
                 {
                     UseDefaultCredentials = false,
                     Credentials = new NetworkCredential(correoEmisor, passwordElEmisor),
-                    EnableSsl = true,
+                    EnableSsl = smtpEnableSsl,
                     DeliveryMethod = SmtpDeliveryMethod.Network,
                     Timeout = 20000
                 };

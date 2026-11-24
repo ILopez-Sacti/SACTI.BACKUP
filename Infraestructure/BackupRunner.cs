@@ -30,6 +30,9 @@ namespace SACTIBACKUP.Infrastructure
         private static readonly List<string> _archivosSubidos = new();
         private static readonly List<string> _erroresSubida = new();
 
+        // Config del correo emisor (se lee de la BD, ya no viaja en el exe).
+        private static CorreoConfig _correoCfg = new();
+
 
         public static async Task EvaluateAndRunAsync()
         {
@@ -45,6 +48,12 @@ namespace SACTIBACKUP.Infrastructure
 
             BackupLogger.Log("BackupRunner", "EvaluateAndRunAsync: inicio.");
             BackupProgressReporter.ReportInitializing("Iniciando proceso de respaldo...");
+
+            // Credenciales del correo emisor desde la BD (ya no hardcodeadas en el exe).
+            _correoCfg = await CorreoConfigService.ObtenerAsync().ConfigureAwait(false) ?? new CorreoConfig();
+            if (string.IsNullOrEmpty(_correoCfg.Password))
+                BackupLogger.Log("BackupRunner",
+                    "ADVERTENCIA: no se obtuvo la configuracion de correo (PARAMETROSCORREO); las notificaciones podrian no enviarse.");
 
             var cfgObj = ConfigManager.Load();
             var cfg = BackupConfigMapper.FromJObject(cfgObj);
@@ -62,8 +71,8 @@ namespace SACTIBACKUP.Infrastructure
                     mensaje: $"No se pudo validar licencia: {errorMsg}",
                     nota: "Ponerse en contacto con su proveedor de servicio de respaldo.",
                     nombreEmpresa: cfg.CorreoFTP.Equals("GENERALSAC", StringComparison.OrdinalIgnoreCase) ? "General SACTI" : (cfg.AliasGlobal ?? "SACTI"),
-                    correoEmisor: "backup@sacti.mx",
-                    passwordElEmisor: "K0fxKheC{hV*",
+                    correoEmisor: _correoCfg.Correo,
+                    passwordElEmisor: _correoCfg.Password, smtpHost: _correoCfg.Host, smtpPuerto: _correoCfg.Puerto, smtpEnableSsl: _correoCfg.EnableSsl,
                     correoReceptorCliente: cfg.CorreoNotificaciones ?? ""
                 );
                 BackupLogger.Log("BackupRunner", $"Notificación de error de licencia: {envioLic.Resumen()}");
@@ -78,8 +87,8 @@ namespace SACTIBACKUP.Infrastructure
                     mensaje: "No se puede realizar el respaldo de su información debido a que su licencia ha caducado.",
                     nota: "En caso de renovación ponerse en contacto con su proveedor de servicio de respaldo.",
                     nombreEmpresa: cfg.CorreoFTP.Equals("GENERALSAC", StringComparison.OrdinalIgnoreCase) ? "General SACTI" : (cfg.AliasGlobal ?? "SACTI"),
-                    correoEmisor: "backup@sacti.mx",
-                    passwordElEmisor: "K0fxKheC{hV*",
+                    correoEmisor: _correoCfg.Correo,
+                    passwordElEmisor: _correoCfg.Password, smtpHost: _correoCfg.Host, smtpPuerto: _correoCfg.Puerto, smtpEnableSsl: _correoCfg.EnableSsl,
                     correoReceptorCliente: EmailService.CombinarListas(lic.CorreoNotificacion, cfg.CorreoNotificaciones)
                 );
                 BackupLogger.Log("BackupRunner", $"Notificación de licencia vencida: {envioVencida.Resumen()}");
@@ -239,8 +248,8 @@ namespace SACTIBACKUP.Infrastructure
                 mensaje: mensajeCorreo,
                 nota: notaCorreo,
                 nombreEmpresa: nombreEmpresa,
-                correoEmisor: "backup@sacti.mx",
-                passwordElEmisor: "K0fxKheC{hV*",
+                correoEmisor: _correoCfg.Correo,
+                passwordElEmisor: _correoCfg.Password, smtpHost: _correoCfg.Host, smtpPuerto: _correoCfg.Puerto, smtpEnableSsl: _correoCfg.EnableSsl,
                 correoReceptorCliente: destinatarios
             );
 
