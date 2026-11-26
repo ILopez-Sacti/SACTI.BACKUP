@@ -4,7 +4,7 @@ using Newtonsoft.Json.Linq;
 using SACTIBACKUP.Entidades;
 using SACTIBACKUP.Infrastructure;
 using System.ComponentModel;
-using System.Data.SqlClient;
+using Microsoft.Data.SqlClient;
 using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;

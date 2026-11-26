@@ -8,12 +8,16 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <!-- Icono de marca para el .exe (Explorador, barra de tareas anclada, Panel de control). -->
     <ApplicationIcon>app.ico</ApplicationIcon>
+    <!-- #1: solo recursos en espanol (quita idiomas de .NET y DevExpress que no se usan). -->
+    <SatelliteResourceLanguages>es</SatelliteResourceLanguages>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="DevExpress.Charts" Version="22.2.3" />
-    <PackageReference Include="DevExpress.Win" Version="22.2.3" />
-    <PackageReference Include="DevExpress.Win.Design" Version="22.2.3" />
+    <!-- #2: solo los paquetes DevExpress que la app usa (editores + grid + skins).
+         DevExpress.Win.Grid arrastra Navigation (XtraEditors/XtraBars), Printing, Utils,
+         Data, Drawing, Images y skins. Se quitan Charts, Spreadsheet, RichEdit, Reports,
+         Scheduler, Diagram, Map, Gauges, PivotGrid, etc. (no se usan). -->
+    <PackageReference Include="DevExpress.Win.Grid" Version="22.2.3" />
 
 	  <PackageReference Include="Microsoft.Data.SqlClient" Version="5.*" />
 
